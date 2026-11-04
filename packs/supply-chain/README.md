@@ -28,7 +28,7 @@ clean git worktrees, so a pack that is not in git is absent at both refs and the
 - **unpinned_execution**: code run from a reference that can move. A GitHub Action not pinned to a full commit SHA (a local `./action` does not count), `npx`, `bunx` or `dlx` with no exact version, `npm install -g` with no exact version, and a remote script piped into a shell. Read from workflows, `action.yml`, package.json scripts, `scripts/*.sh` and Dockerfiles. In package.json scripts, a tool the manifest declares does not count: the lockfile already pins it.
 - **install_policy_gaps**: 0, 1 or 2. Are install scripts disabled, and is a release-age cooldown set (`ignore-scripts=true` and `min-release-age` in `.npmrc`, or the pnpm or yarn equivalents)? The cooldown is enforced by the package manager, not by this pack: a registry lookup here would make the verdict depend on the clock.
 - **lock_drift**: structural items the tree has that `promptwheel.lock.json` does not. `promptwheel lock` reads the repo once and writes its shape: dependencies, install scripts, workflows, modules, import edges between modules, routes, public entry points, and the network hosts the source names. It also records each script's body, native binaries, and what a module can do (network, process spawning, eval), so a new capability shows even when the host is built at runtime. Ordinary edits never touch it. A new route is reported but not held by default; add `--routes` to hold it. On 1,403 commits across eight repositories this guard would have stopped 5.1%, about one in 20. JS and TS only for edges, routes, hosts and capabilities today.
-- **pins_changed**: a fingerprint of the resolved dependency tree, compared base to head, because a new version under an old name is how a worm arrives. It covers every package, version, source and integrity, not the file's bytes, so a release of your own project does not count. Any change needs a reason. Nothing is stored, so the lock does not change across updates and an approved update does not blind the next check. On the same commits this stopped 8.7%, all real dependency changes; use the CI path below for those.
+- **pins_changed**: a fingerprint of the resolved dependency tree, compared base to head, because a new version under an old name is how a worm arrives. It covers every package, version, source and integrity, not the file's bytes, so a release of your own project does not count. Any change needs a reason. Nothing is stored, so the lock does not change across updates and an approved update does not blind the next check. On the same commits this stopped 8.7%, dependency changes; use the CI path below for those.
 
 **Dependency updates in CI.** Give the reason from a step the agent cannot reach. Workflows are a frozen path, so an agent cannot edit this:
 
@@ -77,13 +77,12 @@ and a mandate deleted or narrowed in the same change that violates it stays in f
 | build-images-frozen | `Dockerfile*`, `docker-compose*` | what runs at build and deploy time |
 | publish-scripts-frozen | `scripts/release*`, `scripts/publish*` | the publish path is how a compromise spreads |
 | codeowners-frozen | `CODEOWNERS` | review ownership is set by people |
+| contract-frozen | `promptwheel.config.json`, `sawbuck.config.json` | the contract changes with a reason from a person (`--allow`) |
 | hooks-frozen | `.claude/settings.json`, `.claude/settings.local.json`, `.sawbuck/**` | the hooks that enforce the contract are wired by a person |
 
-The contract itself (`promptwheel.config.json`, `sawbuck.config.json`) is protected as an
-`evaluatorPaths` entry rather than a mandate: a change that edits it alongside a win is `GAMED` by
-declaration unless the change carries a declared reason, while a change that only edits the
-contract (a person retiring a rule) still passes. A mandate there would make the contract
-un-editable through the gate.
+The contract itself (`promptwheel.config.json`, `sawbuck.config.json`) is frozen too, and it is also an
+`evaluatorPaths` entry. A change to it needs `--allow "<reason>"` from a person. Without that, a change that
+only weakens a rule would pass, and the next change would be judged by the weakened contract.
 
 A person who needs to change a frozen path does it in a separate change that only touches that
 path, reviewed as such.
