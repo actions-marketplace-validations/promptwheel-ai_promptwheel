@@ -6,7 +6,7 @@
 
 ![PromptWheel catching an agent game the metric, then passing an honest fix](demo/promptwheel.gif)
 
-## Catch your agent cheating, in 60 seconds
+## See it in 60 seconds
 
 A hand-built cheat, so you can watch the mechanism fire (illustrative, not evidence):
 
@@ -173,7 +173,7 @@ The Action runs straight from its own checkout, no npm install, no build. See [`
 /plugin install promptwheel@promptwheel-ai
 ```
 
-Then `/promptwheel:setup` (write a config) · `/promptwheel:gate` (gate uncommitted changes) · `/promptwheel:improve <cmd>` (keep-if-improved) · `/promptwheel:insights` · `/promptwheel:logbook`. See [`plugins/promptwheel/`](plugins/promptwheel/). A Stop-hook that refuses to let an agent end a turn on a `GAMED` win ships at [`examples/detect-gaming-stop.sh`](examples/detect-gaming-stop.sh).
+Then `/promptwheel:setup` (write a config) · `/promptwheel:gate` (gate uncommitted changes) · `/promptwheel:improve <cmd>` (keep-if-improved) · `/promptwheel:insights`. See [`plugins/promptwheel/`](plugins/promptwheel/). A Stop-hook that refuses to let an agent end a turn on a `GAMED` win ships at [`examples/detect-gaming-stop.sh`](examples/detect-gaming-stop.sh).
 
 ## Trust model
 
