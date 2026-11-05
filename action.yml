@@ -17,6 +17,10 @@ inputs:
     description: 'A declared reason that clears allowable guards (the only path for the supply-chain preset). Set it from a step an agent cannot reach, such as a dependency-bot PR check. See packs/supply-chain/README.md.'
     required: false
     default: ''
+  inconclusive:
+    description: 'What an inconclusive verdict does to the job: fail, or pass with the comment still posted. Use pass where tests may not run in CI. A failed or gamed verdict always fails.'
+    required: false
+    default: 'fail'
   comment:
     description: 'Post the verdict as a PR comment'
     required: false
@@ -30,10 +34,22 @@ runs:
         node-version: '20'
 
     # Runs straight from this action's own checkout: no npm install, no build.
+    # a person's approval on the PR: the newest `sawbuck-allow: <reason>` comment from someone with write access
+    - id: approval
+      if: ${{ inputs.allow == '' && github.event_name == 'pull_request' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPO: ${{ github.repository }}
+        PR: ${{ github.event.pull_request.number }}
+      run: |
+        reason=$(gh api "repos/$REPO/issues/$PR/comments?per_page=100" 2>/dev/null | node "$GITHUB_ACTION_PATH/bin/promptwheel.mjs" pr-allow 2>/dev/null || true)
+        { echo 'allow<<SAWBUCK_ALLOW_END'; printf '%s\n' "$reason"; echo 'SAWBUCK_ALLOW_END'; } >> "$GITHUB_OUTPUT"
+
     - id: gate
       shell: bash
       env:
-        ALLOW: ${{ inputs.allow }}
+        ALLOW: ${{ inputs.allow || steps.approval.outputs.allow }}
       run: |
         set +e
         node "$GITHUB_ACTION_PATH/bin/promptwheel.mjs" run \
@@ -52,4 +68,12 @@ runs:
     # was violated), 2 gamed, 3 inconclusive, 64 usage/config error (a broken config fails the
     # job too, but it is never reported as a verdict).
     - shell: bash
-      run: exit ${{ steps.gate.outputs.exit }}
+      env:
+        GATE_EXIT: ${{ steps.gate.outputs.exit }}
+        INCONCLUSIVE: ${{ inputs.inconclusive }}
+      run: |
+        if [ "$GATE_EXIT" = 3 ] && [ "$INCONCLUSIVE" = pass ]; then
+          echo "::warning::Sawbuck could not measure your tests here, so nothing was proved. Protected paths were still checked."
+          exit 0
+        fi
+        exit "$GATE_EXIT"
