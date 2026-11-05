@@ -14,7 +14,7 @@
 
 import { execSync, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readFileSync, writeFileSync, existsSync, mkdtempSync, symlinkSync, rmSync, mkdirSync, appendFileSync, realpathSync, readdirSync, statSync, copyFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdtempSync, symlinkSync, rmSync, mkdirSync, realpathSync, readdirSync, lstatSync, copyFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, isAbsolute, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -36,6 +36,9 @@ const spread = (xs) => { const a = xs.filter((x) => x != null); return a.length 
 // repo is still measuring in (a long gate elsewhere must not lose its worktree mid-run)
 function tmpOwnerTag(repo) { let r = repo; try { r = realpathSync(repo); } catch { /* keep as given */ } return createHash('sha1').update(String(r)).digest('hex').slice(0, 8); }
 const tmpPrefix = (repo, kind) => `${kind}-${tmpOwnerTag(repo)}-`;
+// exactly the names mkdtemp makes from tmpPrefix: the kind, the 8-hex owner tag, then mkdtemp's 6 random
+// characters. Self-heal removes nothing else, so a folder that only starts with "promptwheel-" is never ours.
+const ENGINE_TMP = /^(promptwheel-src|promptwheel|pw-idx)-([0-9a-f]{8})-[A-Za-z0-9]{6}$/;
 
 // usage / config errors exit 64 (EX_USAGE), so they can never be confused with a verdict
 // (0 pass, 1 fail, 2 gamed, 3 inconclusive): in CI a config typo must not read as GAMED.
@@ -68,7 +71,7 @@ const relOf = (repo, p) => { try { return relative(repo, p) || p; } catch { retu
 // resolve a config + its `extends` chain into a flat, provenance-tagged metric list.
 // `extends` is a path (or array of paths) to base configs, relative to the config file:
 // a repo INHERITS their guardrails, and a local metric of the same name overrides the inherited one.
-function resolveConfig(p, repo, label, seen) {
+function resolveConfig(p, repo, seen) {
   const abs = realpathSync(p);
   if (seen.has(abs)) bad(`config inheritance cycle at ${relOf(repo, p)}`);
   seen.add(abs);
@@ -80,16 +83,16 @@ function resolveConfig(p, repo, label, seen) {
     for (const ref of [].concat(cfg.extends || [])) {
       const bp = isAbsolute(ref) ? ref : join(dirname(p), ref);
       if (!existsSync(bp)) bad(`extends target not found: ${ref} (from ${relOf(repo, p)})`);
-      const base = resolveConfig(bp, repo, relOf(repo, bp), seen);
+      const base = resolveConfig(bp, repo, seen);
       for (const m of base.metrics) byName.set(m.name, m);
       for (const md of (base.mandates || [])) if (md && md.name) mandatesByName.set(md.name, md);
-      for (const k of ['repeat', 'linkNodeModules', 'linkDirs', 'env', 'setup', 'record', 'gamingThreshold', 'evaluatorPaths', 'allowTrailer']) if (base[k] !== undefined) scalars[k] = base[k];
+      for (const k of ['repeat', 'linkNodeModules', 'linkDirs', 'env', 'setup', 'gamingThreshold', 'evaluatorPaths', 'allowTrailer']) if (base[k] !== undefined) scalars[k] = base[k];
     }
     for (const m of (cfg.metrics || [])) {
-      byName.set(m.name, { ...m, __src: label, __override: byName.has(m.name) });
+      byName.set(m.name, m);
     }
-    for (const md of (cfg.mandates || [])) if (md && md.name) mandatesByName.set(md.name, { ...md, __src: label });
-    for (const k of ['repeat', 'linkNodeModules', 'linkDirs', 'env', 'setup', 'record', 'gamingThreshold', 'evaluatorPaths', 'allowTrailer']) if (cfg[k] !== undefined) scalars[k] = cfg[k];
+    for (const md of (cfg.mandates || [])) if (md && md.name) mandatesByName.set(md.name, md);
+    for (const k of ['repeat', 'linkNodeModules', 'linkDirs', 'env', 'setup', 'gamingThreshold', 'evaluatorPaths', 'allowTrailer']) if (cfg[k] !== undefined) scalars[k] = cfg[k];
     return { ...scalars, metrics: [...byName.values()], mandates: [...mandatesByName.values()] };
   } finally {
     seen.delete(abs); // only ACTIVE ancestors are a cycle, a diamond (a base reached two ways) is fine
@@ -99,7 +102,7 @@ function resolveConfig(p, repo, label, seen) {
 function loadConfig(repo) {
   const p = join(repo, 'promptwheel.config.json');
   if (!existsSync(p)) bad('no promptwheel.config.json, run: promptwheel init   (writes one for your stack)');
-  const cfg = resolveConfig(p, repo, 'local', new Set());
+  const cfg = resolveConfig(p, repo, new Set());
   if (!Array.isArray(cfg.metrics) || cfg.metrics.length === 0) bad('config.metrics must be a non-empty array');
   return cfg;
 }
@@ -112,8 +115,14 @@ const hasConfigFile = (repo) => existsSync(join(repo, 'promptwheel.config.json')
 // measurement actually runs in a throwaway worktree. Lets `run` and `check()` work with no config
 // file; `init` is for customizing. A repo with no test command gets a sentinel that reads inert ->
 // INCONCLUSIVE (never a fake green), with a message pointing at the fix.
-function autoConfig(repo) {
-  return { ...detectEnv(repo), metrics: [{ name: 'tests_pass', cmd: detectTestCmd(repo), extract: 'exit', direction: 'pass', guard: true }] };
+function autoConfig(repo, at = stackAt(repo)) {
+  return { ...detectEnv(repo, at), metrics: [{ name: 'tests_pass', cmd: detectTestCmd(repo, at), extract: 'exit', direction: 'pass', guard: true }] };
+}
+// where stack detection looks: the working tree, or the tracked files as of `ref` (the repo as it was before a change)
+function stackAt(repo, ref) {
+  if (!ref) return { has: (f) => existsSync(join(repo, f)), read: (f) => readFileSync(join(repo, f), 'utf8') };
+  const read = (f) => execFileSync('git', ['show', `${ref}:${f}`], { cwd: repo, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+  return { has: (f) => { try { read(f); return true; } catch { return false; } }, read };
 }
 
 function resolveBase(repo, base) {
@@ -123,7 +132,8 @@ function resolveBase(repo, base) {
   catch { bad('promptwheel: no commits yet, make an initial commit before gating'); }
   for (const b of ['origin/main', 'origin/master', 'main', 'master']) {
     let mb = '';
-    try { mb = git(['merge-base', 'HEAD', b], repo); } catch { continue; }
+    // stderr ignored: a ref that is not there (no origin/main in this clone) is expected, not an error to print
+    try { mb = execFileSync('git', ['merge-base', 'HEAD', b], { cwd: repo, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { continue; }
     // on the trunk itself the merge-base IS HEAD; comparing a commit to itself would be a
     // trivial PASS that verified nothing, so fall through to the last commit instead.
     if (mb && mb !== head) return mb;
@@ -132,15 +142,21 @@ function resolveBase(repo, base) {
   catch { bad('promptwheel: no commit to compare against (one commit, or a shallow clone): pass --base, or --working'); }
 }
 
-function runMetric(cwd, m, env) {
-  let stdout = '', code = 0;
+// exit statuses of a sample list, kept beside it: 127 (the shell found no such command), 126 (it could not
+// execute it) or no status (killed: a timeout) mean the metric never ran, which needs a different fix from a
+// test that ran and failed
+const exitCodes = new WeakMap();
+const neverRan = (samples) => { const c = exitCodes.get(samples) || []; return c.length > 0 && c.every((x) => x == null || x === 126 || x === 127); };
+function runMetric(cwd, m, env, codes) {
+  let stdout = '', code = 0, status = 0;
   // Never leak the harness's own node:test context into the measured gate: a metric like
   // `node --test` would see NODE_TEST_CONTEXT, act as a child reporter, and report a bogus
   // exit code (so the gate can't be trusted when PromptWheel itself runs under a test runner).
   const childEnv = { ...(env || process.env) }; delete childEnv.NODE_TEST_CONTEXT;
   try {
     stdout = execSync(m.cmd, { cwd, env: childEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: (m.timeoutSec ?? 300) * 1000 });
-  } catch (e) { code = e.status ?? 1; stdout = `${e.stdout || ''}${e.stderr || ''}`; }
+  } catch (e) { status = e.status ?? null; code = e.status ?? 1; stdout = `${e.stdout || ''}${e.stderr || ''}`; }
+  if (codes) codes.push(status);
   return extract(stdout, code, m.extract, m.allowNonzero);
 }
 
@@ -169,9 +185,9 @@ function extract(stdout, code, mode, allowNonzero) {
 // with linkNodeModules:false → link nothing); `env` sets vars ({wt} → the worktree path, so a
 // Python run can put the measured ref FIRST on PYTHONPATH). Ecosystem knowledge lives in config,
 // not here, the engine stays ecosystem-agnostic.
+const linkDirsOf = (cfg) => (Array.isArray(cfg.linkDirs) ? cfg.linkDirs : (cfg.linkNodeModules === false ? [] : ['node_modules']));
 function bridgeEnv(repo, wt, cfg) {
-  const linkDirs = Array.isArray(cfg.linkDirs) ? cfg.linkDirs : (cfg.linkNodeModules === false ? [] : ['node_modules']);
-  for (const d of linkDirs) {
+  for (const d of linkDirsOf(cfg)) {
     if (existsSync(join(repo, d)) && !existsSync(join(wt, d))) {
       try { symlinkSync(join(repo, d), join(wt, d)); } catch { /* best effort */ }
     }
@@ -196,8 +212,9 @@ function measureAt(repo, ref, cfg, repeat) {
     runSetup(wt, cfg, env);
     const out = {};
     for (const m of cfg.metrics) {
-      const samples = [];
-      for (let i = 0; i < repeat; i++) samples.push(runMetric(wt, m, env));
+      const samples = [], codes = [];
+      for (let i = 0; i < repeat; i++) samples.push(runMetric(wt, m, env, codes));
+      exitCodes.set(samples, codes);
       out[m.name] = samples;
     }
     return out;
@@ -266,9 +283,12 @@ const NON_SOURCE = [
   /_spec\.rb$/i,
   /[a-z0-9](Test|Tests)\.(java|kt|kts|scala)$/,
   /\.snap$/i, /(^|\/)golden[^/]*$/i, /\.golden$/i,
-  // a grader/eval/score FILE by name (eval.ts, grader-x.js, score.test.mjs, scoring.ts), never a prefix:
-  // evaluate.ts, evaluation.js, scoreboard.js are production source and must stay in the slice
-  /(^|\/)(eval|evals|grader|graders|score|scorer|scoring)([._-][^/]*)?\.[cm]?[jt]s$/i,
+  // a grader/eval/score FILE by name in a scripting language (eval.py, grader-x.js, grade.sh, scoring.ts), never a
+  // prefix: evaluate.ts, evaluation.py, scoreboard.js stay source. Compiled names stay source too (eval.c, eval.go
+  // are interpreters; Score.java is a type), and so do .tsx/.vue files (a Score component, a /score page).
+  /(^|\/)(eval|evals|grade|grader|graders|score|scorer|scoring)([._-][^/]*)?\.([cm]?[jt]s|py|sh|bash|zsh|rb|pl|php|lua|r|jl)$/i,
+  // anything under an evals/ or grader(s)/ directory. Not eval/ (an interpreter's package) or scoring/ (a product module).
+  /(^|\/)(evals|graders?)\//i,
   // config files only, require a .config/.conf/.setup segment so PRODUCTION source that
   // happens to be named after a tool (e.g. src/installers/eslint.ts) is NOT swept out of
   // the source slice (a false sweep here can flag an honest win as GAMED).
@@ -279,7 +299,7 @@ const NON_SOURCE = [
   // promptwheel's OWN evaluator surface: the config that defines the gate
   // and any pack copied into the repo by `init --preset`. Editing these is
   // moving the goalposts, never a production improvement, an agent that
-  // "improved" security_findings by deleting pattern rules must show 0%
+  // "improved" a scanner count by deleting its rules must show 0%
   // retained in the source-only re-run, not 100%.
   /(^|\/)promptwheel\.config\.json$/i,
   /(^|\/)\.promptwheel\//i,
@@ -311,9 +331,9 @@ function evaluatorMatcher(cfg) {
 // forbids ANY change to its paths (same glob semantics as evaluatorPaths). A hit fails the gate
 // regardless of metrics and rides at the top of the report; mandates inherit through `extends`,
 // so a parent scope's rule holds for every repo beneath it.
-// The mandates in force are the UNION of the head config's and the base ref's (`baseMandates`,
-// resolved by gateDefAtRef): deleting a mandate in the same change that violates it does not
-// clear it. A mandate removed at head but violated in the diff is reported with `removed: true`; one
+// The mandates in force are the base ref's (`baseMandates`, resolved by gateDefAtRef), in their head
+// version when both have them: deleting a mandate in the same change that violates it does not
+// clear it, and one the change adds does not apply to it (see below). A mandate removed at head but violated in the diff is reported with `removed: true`; one
 // whose paths were edited at head (same name, different paths) is tested in BOTH versions and reported
 // with `edited: true`, so narrowing a rule in the change that breaks it does not clear it either.
 // The honest way to retire one is a separate change that only edits the config.
@@ -457,7 +477,7 @@ function judgeGaming(m, srcResult, threshold = 0.5) {
 // main
 // ---------------------------------------------------------------------------
 // snapshot the working tree (tracked + untracked) into a dangling commit WITHOUT
-// touching the real index or files, so a gate/improve sees a file an agent just added.
+// touching the real index or files, so a gate sees a file an agent just added.
 // Returns 'HEAD' when nothing changed.
 function workingSnapshot(repo) {
   const idxDir = mkdtempSync(join(tmpdir(), tmpPrefix(repo, 'pw-idx')));
@@ -482,12 +502,16 @@ function workingSnapshot(repo) {
   }
 }
 
-// self-heal: a hard-killed run (SIGKILL / power loss) can leave an orphaned worktree, 
+// self-heal: a hard-killed run (SIGKILL / power loss) can leave an orphaned worktree,
 // its `finally` never ran. On the next run, drop stale worktree registry entries and any
-// abandoned /tmp checkout, so nothing accumulates in your repo or temp dir. Never touches a
-// live worktree (a still-registered dir, or this repo's checkout younger than 1h). A dir tagged
-// for ANOTHER repo may be mid-measurement, so it gets a full day; after that it is an orphan of a
-// repo that was deleted or moved (a new real path is a new tag nobody will ever claim).
+// abandoned /tmp checkout, so nothing accumulates in your repo or temp dir. It only ever removes a
+// directory whose name is exactly what this engine generates (ENGINE_TMP): a folder named
+// promptwheel-notes, or another repo's worktree named promptwheel-site-wt, is not ours at any age.
+// Ages, by dir mtime: this repo's unregistered checkout after 1h; this repo's still-registered worktree
+// after a full day (a killed run leaves it registered, and a younger one may be a concurrent gate still
+// measuring); a dir tagged for ANOTHER repo after a full day (an orphan of a repo that was deleted or
+// moved: a new real path is a new tag nobody will ever claim). A registered worktree that is not
+// tagged for this repo is never touched: it may be yours.
 function selfHeal(repo) {
   try {
     git(['worktree', 'prune'], repo); // remove registry entries whose dir is already gone (always safe)
@@ -496,16 +520,18 @@ function selfHeal(repo) {
         .split('\n').filter((l) => l.startsWith('worktree ')).map((l) => l.slice(9).trim()),
     );
     const tmp = tmpdir(), now = Date.now(), mine = tmpOwnerTag(repo);
-    const TAGGED = /^(promptwheel-src|promptwheel|pw-idx)-([0-9a-f]{8})-/;
     for (const name of readdirSync(tmp)) {
-      if (!name.startsWith('promptwheel-') && !name.startsWith('pw-idx-')) continue; // worktrees + temp-index dirs
-      const tag = (name.match(TAGGED) || [])[2] || null;
-      // ours after an hour; another repo's, or an untagged dir (an older engine's), only after a full day
-      const maxAge = tag === mine ? 3600_000 : 86_400_000;
+      const made = ENGINE_TMP.exec(name);
+      if (!made) continue;   // not a name this engine generates (worktrees + temp-index dirs): never removed
+      const tag = made[2];
+      // ours after an hour; another repo's only after a full day
       const p = join(tmp, name);
-      if (tracked.has(p)) continue;                   // a live/registered worktree, leave it
-      try { if (statSync(p).mtimeMs < now - maxAge) rmSync(p, { recursive: true, force: true }); } catch { /* */ }
+      if (tracked.has(p) && tag !== mine) continue;   // a registered worktree this repo's gate did not make
+      const maxAge = tag === mine && !tracked.has(p) ? 3600_000 : 86_400_000;
+      // lstat: the engine makes directories, so a file or a symlink under one of its names is left alone
+      try { const st = lstatSync(p); if (st.isDirectory() && st.mtimeMs < now - maxAge) rmSync(p, { recursive: true, force: true }); } catch { /* */ }
     }
+    git(['worktree', 'prune'], repo);   // drop the registry entries of anything removed above
   } catch { /* cleanup must never block the gate */ }
 }
 
@@ -537,18 +563,25 @@ function warnEditableInstall(repo) {
 // guarded metric in the very diff it "passes". We resolve the gate as of BASE too and, if a
 // guard was dropped, re-measure it under its BASE definition; the pass only reads GAMED when
 // that guard WOULD HAVE FAILED at head (a real regression hidden by moving the goalposts).
-const GATE_SCALARS = ['gamingThreshold', 'evaluatorPaths', 'allowTrailer'];
+const GATE_SCALARS = ['gamingThreshold', 'evaluatorPaths', 'allowTrailer', 'setup', 'env', 'linkDirs', 'linkNodeModules'];
+// what runs or shapes every measurement besides the metric's own command. A setup can rewrite a test and an
+// env var can skip one, so these are part of the gate: fingerprinted, and held at their base values for the
+// change that edits them (see detectGamingPass).
+const measureOf = (s) => ({ setup: s.setup, env: s.env, linkDirs: s.linkDirs, linkNodeModules: s.linkNodeModules });
+const measuredWith = (s) => JSON.stringify([s.setup ?? null, Object.entries(s.env || {}).map(([k, v]) => `${k}=${v}`).sort(), [...linkDirsOf(s)].sort()]);
 
 // Resolve the gate definition as of `ref` (metrics + mandates + scalars), following `extends` by
 // reading every file from that ref via `git show`, mirroring resolveConfig (a parent's mandates
 // hold beneath it; a local mandate of the same name overrides). Returns { metrics:Map, scalars }
-// with scalars.mandates, or null when there is no config at `ref` (a gate ADDED in this range is
-// not a weakening). Never exits: any missing/unreadable file or parse error yields null (that
-// branch simply contributes nothing).
+// with scalars.mandates, or null when there is no config at `ref` (gate() then falls back to the
+// zero-config gate the repo ran under, see zeroConfigGate). Never exits: any missing/unreadable file or
+// parse error yields null (that branch simply contributes nothing), and `partial` says an extends target
+// could not be read at `ref` (it lives outside the repo), so how the base measured is not fully known.
 function gateDefAtRef(repo, ref) {
   // quiet: a missing path makes `git show` exit nonzero and print "fatal:" to stderr; swallow it
   const readAt = (p) => { try { return execFileSync('git', ['show', `${ref}:${p}`], { cwd: repo, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }); } catch { return null; } };
   const seen = new Set();
+  let partial = false;
   const resolve = (p) => {
     if (seen.has(p)) return null;
     seen.add(p);
@@ -557,9 +590,11 @@ function gateDefAtRef(repo, ref) {
     let cfg; try { cfg = JSON.parse(raw); } catch { return null; }
     const byName = new Map(); const mandatesByName = new Map(); const scalars = {};
     for (const ext of [].concat(cfg.extends || [])) {
-      if (isAbsolute(ext)) continue;                 // outside the repo, cannot git-show; unchanged anyway
-      const base = resolve(join(dirname(p), ext).split('\\').join('/'));
-      if (!base) continue;
+      if (isAbsolute(ext)) { partial = true; continue; }   // outside the repo, cannot git-show; unchanged anyway
+      const bp = join(dirname(p), ext).split('\\').join('/');
+      const again = seen.has(bp);                    // a diamond: already merged, not a missing piece
+      const base = resolve(bp);
+      if (!base) { if (!again) partial = true; continue; }
       for (const m of base.metrics.values()) byName.set(m.name, m);
       for (const md of base.scalars.mandates) mandatesByName.set(md.name, md);
       for (const k of GATE_SCALARS) if (base.scalars[k] !== undefined) scalars[k] = base.scalars[k];
@@ -570,18 +605,35 @@ function gateDefAtRef(repo, ref) {
     scalars.mandates = [...mandatesByName.values()];
     return { metrics: byName, scalars };
   };
-  return resolve('promptwheel.config.json');
+  const def = resolve('promptwheel.config.json');
+  return def && { ...def, partial };
 }
 
+// The gate a repo with no config ran under: the detected test command (source-only re-run on) with the
+// stack's env and linkDirs, detected from the tracked files as of `ref`. A change that adds the first
+// config is judged against this, so `tests_pass.cmd: "true"` in a new config is an edited guard, not a
+// fresh start. `initSetup` is the setup `init` would add: a first config that carries exactly it has not
+// changed how the gate measures. With no test command to detect (the placeholder) the old gate measured
+// nothing, so its setup is no baseline (`partial`).
+function zeroConfigGate(repo, ref) {
+  const at = stackAt(repo, ref), auto = autoConfig(repo, at);
+  return { metrics: new Map(auto.metrics.map((m) => [m.name, m])), scalars: { mandates: [], ...measureOf(auto) }, zeroConfig: true, initSetup: detectSetup(repo, at), partial: auto.metrics[0].cmd === PLACEHOLDER_TEST };
+}
+
+// how a metric is measured and judged: change any of these on a guard and it is a different guard
+// what init writes when it finds no test command. It guards nothing, so replacing it is setup, not a weakened gate.
+const PLACEHOLDER_TEST = 'echo "set your test command in promptwheel.config.json" && false';
+const measuredBy = (m) => JSON.stringify([m.cmd ?? null, m.extract ?? 'number', m.direction || 'up', m.exact === true, m.report === true]);
 // an order-independent SHA-256 (truncated) fingerprint of a gate definition, for the audit record
 function gateFingerprint(metricsList, scalars) {
   const norm = {
     metrics: metricsList.map((m) => ({
-      name: m.name, guard: m.guard === true, direction: m.direction || 'up',
+      name: m.name, guard: m.guard === true, measuredBy: measuredBy(m),
       gamingThreshold: m.gamingThreshold ?? null, gamingCheck: m.gamingCheck !== false,
     })).sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)),
     gamingThreshold: scalars.gamingThreshold ?? null,
     evaluatorPaths: Array.isArray(scalars.evaluatorPaths) ? [...scalars.evaluatorPaths].sort() : [],
+    measuredWith: measuredWith(scalars),
     mandates: Array.isArray(scalars.mandates) ? scalars.mandates.map((m) => ({ name: String(m.name || ''), paths: [...(Array.isArray(m.paths) ? m.paths : [])].sort() })).sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)) : [],
   };
   return createHash('sha256').update(JSON.stringify(norm)).digest('hex').slice(0, 16);
@@ -626,7 +678,8 @@ function verdictFingerprint(report) {
   return createHash('sha256').update(JSON.stringify(norm)).digest('hex').slice(0, 16);
 }
 
-// guarded metrics that HEAD dropped relative to BASE (removed entirely, or guard turned off)
+// guarded metrics that HEAD dropped relative to BASE (removed entirely, or guard turned off), or
+// measures another way (a new cmd, extract, direction, exact or report flag): `cmd: "true"` is a dropped guard too
 function gateWeakenings(baseGate, headMetrics) {
   if (!baseGate) return [];
   const head = new Map(headMetrics.map((m) => [m.name, m]));
@@ -636,6 +689,7 @@ function gateWeakenings(baseGate, headMetrics) {
     const hm = head.get(bm.name);
     if (!hm) weak.push({ name: bm.name, change: 'guard-removed', def: bm });
     else if (hm.guard !== true) weak.push({ name: bm.name, change: 'guard-disabled', def: bm });
+    else if (!bm.report && bm.cmd !== PLACEHOLDER_TEST && measuredBy(hm) !== measuredBy(bm)) weak.push({ name: bm.name, change: 'guard-edited', def: bm });
   }
   return weak;
 }
@@ -654,29 +708,51 @@ function readAllowTrailer(repo, ref) {
   return m && m[1].trim() ? { reason: m[1].trim().slice(0, 300) } : null;
 }
 
+// A change is judged by the gate that was in force before it (`baseGate`: the config at base, or the
+// zero-config gate when this change adds the first config). So a change cannot switch off the source-only
+// re-run for a metric that had it, loosen gamingThreshold, or swap the setup, env or linked dirs it is
+// measured with: the base values hold for the change that edits them, and apply from the next one.
+const gamingCheckOff = (cm, baseGate) => {
+  if (!cm || cm.gamingCheck !== false) return false;
+  const bm = baseGate && baseGate.metrics.get(cm.name);
+  return !bm || bm.gamingCheck === false;   // off before this change too, or a metric this change adds
+};
+function gamingThresholdFor(cm, cfg, baseGate) {
+  const now = cm.gamingThreshold ?? cfg.gamingThreshold ?? 0.5;
+  const bm = baseGate && baseGate.metrics.get(cm.name);
+  const before = bm ? (bm.gamingThreshold ?? baseGate.scalars.gamingThreshold ?? (baseGate.partial ? now : 0.5)) : now;
+  return Math.max(now, before);   // the stricter of before and after
+}
+
 // The three Section 3 checks, run only with detectGaming, in order: (1) re-prove every actual
 // win with the agent's source edits alone; (2) content-hash auto-fail: a declared evaluatorPath
 // gate file edited in this diff is a moved goalpost, so a metric that improved alongside it is
 // gamed by declaration, deterministic even if the source-only re-run read inert; (3) gate
-// integrity: resolve the gate as of BASE, re-measure any guard HEAD dropped under its base
-// definition (it only counts as tampering if it WOULD HAVE FAILED at head), and fingerprint the
-// gate definition at both refs (metrics, evaluatorPaths, gamingThreshold, mandates) so a quietly
-// deleted guard or mandate is tamper-evident: base != head is recorded as gate.changed and
+// integrity: take the gate as of BASE, re-measure any guard HEAD dropped, edited or measures with
+// another setup, env or linked dirs, under its base definition (it only counts as tampering if it
+// WOULD HAVE FAILED at head), and fingerprint the gate definition at both refs (metrics,
+// evaluatorPaths, gamingThreshold, mandates, setup, env, linked dirs) so a quietly deleted guard
+// or mandate is tamper-evident: base != head is recorded as gate.changed and
 // printed, whatever the verdict. Mutates `metrics` in place (gamed/sourceOnly/retained/
 // gamingReason) and returns the report.gate record. An allow trailer can still clear a gamed
 // metric afterwards, in gate().
-function detectGamingPass(repo, base, head, cfg, metrics, repeat) {
+function detectGamingPass(repo, base, head, cfg, metrics, repeat, baseGate) {
+  // how the base measured. Unknown (`partial`) reads as unchanged; so does a first config that adds only the setup `init` detects
+  const bs = baseGate ? (baseGate.partial ? { ...baseGate.scalars, ...measureOf(cfg) } : baseGate.scalars) : null;
+  const asInit = !!bs && baseGate.zeroConfig && measuredWith({ ...bs, setup: baseGate.initSetup }) === measuredWith(cfg);
+  const measureChanged = !!bs && !asInit && measuredWith(bs) !== measuredWith(cfg);
+  const baseRun = measureChanged ? { ...cfg, ...measureOf(bs) } : cfg;   // the head gate, run with the base setup, env and linked dirs
   const toProve = [];
   for (const m of metrics) {
     if (m.status !== 'improved') continue;
     const cm = cfg.metrics.find((c) => c.name === m.name);
-    if (cm.gamingCheck === false) continue;   // tripwire / test-side guards aren't re-proven from source (their gain legitimately lives in test files)
+    if (gamingCheckOff(cm, baseGate)) continue;   // tripwire / test-side guards aren't re-proven from source (their gain legitimately lives in test files)
     toProve.push(cm);
   }
-  const srcResults = measureSourceOnlyAll(repo, base, head, toProve, cfg, repeat);   // one patched checkout for all of them
+  const srcResults = measureSourceOnlyAll(repo, base, head, toProve, baseRun, repeat);   // one patched checkout for all of them
   for (const cm of toProve) {
     const m = metrics.find((x) => x.name === cm.name);
-    const j = judgeGaming(m, srcResults[cm.name], cm.gamingThreshold ?? cfg.gamingThreshold ?? 0.5);
+    const j = judgeGaming(m, srcResults[cm.name], gamingThresholdFor(cm, cfg, baseGate));
     m.gamed = j.gamed; m.sourceOnly = j.sourceOnly; m.retained = j.retained; m.gamingReason = j.reason;
     if (j.unprovable) m.unprovable = true;
   }
@@ -687,32 +763,55 @@ function detectGamingPass(repo, base, head, cfg, metrics, repeat) {
   if (split.source.length && split.nonSource.length) {
     const held = metrics.filter((m) => m.status === 'unchanged' && m.direction === 'pass' && m.after === 1 && !m.tripwire);
     const defs = held.map((m) => cfg.metrics.find((c) => c.name === m.name)).filter(Boolean);
-    const res = measureSourceOnlyAll(repo, base, head, defs, cfg, repeat);
+    const res = measureSourceOnlyAll(repo, base, head, defs, baseRun, repeat);
     for (const m of held) { const r = res[m.name]; if (r && r.samples && r.samples.length && median(r.samples) !== 1) m.heldByTestEdit = true; }
   }
-  const evalChanged = changedEvaluatorPaths(repo, base, head, cfg);
+  // a file declared as a goalpost before this change still is one for this change: dropping the declaration in the
+  // same diff that edits the file does not make the edit count as source
+  const declared = [...new Set([...(cfg.evaluatorPaths || []), ...((baseGate && baseGate.scalars.evaluatorPaths) || [])])];
+  const evalChanged = changedEvaluatorPaths(repo, base, head, { ...cfg, evaluatorPaths: declared });
   if (evalChanged.length) {
     for (const m of metrics) {
       if (m.status !== 'improved' || m.gamed === true) continue;
       const cm = cfg.metrics.find((c) => c.name === m.name);
-      if (cm && cm.gamingCheck === false) continue; // tripwire/test-side guards legitimately live in gate files
+      if (gamingCheckOff(cm, baseGate)) continue; // tripwire/test-side guards legitimately live in gate files
       m.gamed = true;
       m.gamingReason = `a declared evaluatorPath gate file changed in this diff (${evalChanged.map((e) => e.path).join(', ')}); a win alongside a goalpost edit is gamed by declaration`;
     }
   }
-  const baseGate = gateDefAtRef(repo, base);
   const weak = gateWeakenings(baseGate, cfg.metrics);
+  // the setup, env or linked dirs changed: every guard the base had is measured again the way it was measured before
+  if (measureChanged) for (const bm of baseGate.metrics.values()) {
+    if (bm.guard === true && !bm.report && bm.cmd !== PLACEHOLDER_TEST && !weak.some((w) => w.name === bm.name)) weak.push({ name: bm.name, change: 'measurement-edited', def: bm });
+  }
   const weakened = [];
   if (weak.length) {
     const defs = weak.map((w) => w.def);
-    const b = measureAt(repo, base, { ...cfg, metrics: defs }, repeat);
-    const a = measureAt(repo, head, { ...cfg, metrics: defs }, repeat);
+    const b = measureAt(repo, base, { ...baseRun, metrics: defs }, repeat);
+    const a = measureAt(repo, head, { ...baseRun, metrics: defs }, repeat);
+    const evs = new Map();
     for (const w of weak) {
       const ev = evaluate(w.def, b[w.name], a[w.name], repeat);
-      if (!ev.ok) weakened.push({ name: w.name, change: w.change, status: ev.status });
+      evs.set(w.name, ev);
+      // an edited guard that still fails under its old definition was turned green by the edit, not the code
+      let hidden = !ev.ok || (w.change === 'guard-edited' && ev.inert);
+      // a guard measured another way counts only when the new measurement hides it: it fails the old way and reads fine the new way
+      if (w.change === 'measurement-edited') { const hm = metrics.find((x) => x.name === w.name); hidden = (!ev.ok || !!ev.inert) && !!hm && hm.ok && !hm.inert; }
+      if (hidden) weakened.push({ name: w.name, change: w.change, status: ev.inert ? 'failed' : ev.status });
+    }
+    // a win under the old definition still has to be earned in the source: swapping or renaming the guard in the same
+    // change does not skip the source-only re-run
+    const won = weak.filter((w) => w.def.gamingCheck !== false && !weakened.some((x) => x.name === w.name) && evs.get(w.name).status === 'improved');
+    if (won.length) {
+      const src = measureSourceOnlyAll(repo, base, head, won.map((w) => w.def), baseRun, repeat);
+      for (const w of won) {
+        const j = judgeGaming({ name: w.name, direction: w.def.direction || 'up', guard: true, ...evs.get(w.name) }, src[w.name], w.def.gamingThreshold ?? (bs && bs.gamingThreshold) ?? 0.5);
+        if (j.gamed) weakened.push({ name: w.name, change: w.change, status: 'gamed' });
+      }
     }
   }
-  const fpBase = baseGate ? gateFingerprint([...baseGate.metrics.values()], baseGate.scalars) : null;
+  // the fingerprint is of a config file: `base` stays null when there was none there (the zero-config gate is not a file)
+  const fpBase = baseGate && !baseGate.zeroConfig ? gateFingerprint([...baseGate.metrics.values()], bs) : null;
   const fpHead = gateFingerprint(cfg.metrics, cfg);
   const info = {
     fingerprint: { base: fpBase, head: fpHead },
@@ -731,7 +830,7 @@ function detectGamingPass(repo, base, head, cfg, metrics, repeat) {
 // (or a weakened gate) is GAMED; INCONCLUSIVE when nothing could be certified. A guard that never
 // runs (inert: a pass/fail metric stuck at 0 across both refs) verifies nothing, so a bare no-op
 // run is not laundered into a green PASS, BUT an inert guard must not bury a genuine, measured win
-// elsewhere (that would make `improve` revert good changes and misread them as a plateau). And a
+// elsewhere (a loop reading the verdict would throw away a good change). And a
 // win whose source-only re-run could not be applied (`unprovable`) is never a PASS either: a green
 // the engine could not re-prove is exactly the green it exists to doubt.
 export function deriveVerdict(metrics, gateInfo = null, mandated = false) {
@@ -769,17 +868,26 @@ function gate(repo, opts) {
   // a guard this change adds has no value at base, because its scanner did not exist there. That is adoption,
   // not a failure: it starts counting from head. Removing a guard is still caught (gateWeakenings), and a guard the
   // base contract already had still fails when it cannot be measured. A zero-config run has no contract to adopt.
-  const baseDefs = opts.config ? null : gateDefAtRef(repo, base);
+  const fileGate = gateDefAtRef(repo, base);
+  const baseDefs = opts.config ? null : fileGate;
   const adopted = (name) => !opts.config && !(baseDefs && baseDefs.metrics.has(name));
+  // the gate in force before this change: the config committed at base, or, when this change adds the
+  // first config, the zero-config gate the repo ran under until now
+  const baseGate = opts.detectGaming ? (fileGate || (opts.config ? null : zeroConfigGate(repo, base))) : null;
   const metrics = cfg.metrics.map((m) => {
     const ev = evaluate(m, before[m.name], after[m.name], repeat);
     if (ev.status === 'unmeasurable' && ev.before == null && ev.after != null && adopted(m.name)) { ev.ok = true; ev.adopted = true; }
     // a `report` guard tells you and does not fail: a contract can start by watching and tighten later
     if (m.report && !ev.ok && ev.status === 'regressed') { ev.ok = true; ev.noted = true; }
-    return { name: m.name, direction: m.direction || 'up', guard: !!m.guard, ...(m.gamingCheck === false ? { tripwire: true } : {}), ...ev };
+    // an inert guard: did its command run and fail, or never run? `ran` says where it ran (absent: at neither ref)
+    if (ev.inert && m.cmd !== PLACEHOLDER_TEST) {
+      const nb = neverRan(before[m.name]), na = neverRan(after[m.name]);
+      if (!nb || !na) ev.ran = !nb && !na ? 'both' : nb ? 'head' : 'base';
+    }
+    return { name: m.name, direction: m.direction || 'up', guard: !!m.guard, ...(gamingCheckOff(m, baseGate) ? { tripwire: true } : {}), ...ev };
   });
   // Section 3 (gaming detection), on by default: mutates `metrics` and yields the gate record
-  const gateInfo = opts.detectGaming ? detectGamingPass(repo, base, head, cfg, metrics, repeat) : null;
+  const gateInfo = opts.detectGaming ? detectGamingPass(repo, base, head, cfg, metrics, repeat, baseGate) : null;
   // declared override: a Promptwheel-Allow trailer (or --allow) acknowledges an intentional
   // goalpost/gate change, so a would-be GAMED becomes PASS, recorded in report.allowed for review.
   // It covers an `unprovable` win too (the source-only re-run could not be applied): the declared
@@ -820,7 +928,7 @@ function gate(repo, opts) {
       for (const m of ga) { m.ok = true; m.allowed = true; allowed.cleared.push(m.name); }
     } else for (const m of ga) m.allowable = true;   // failed, and a declared reason would clear it: say so in the report
   }
-  // mandates run first: a protected-path hard rule fails the gate no matter what the metrics say.
+  // mandates: a protected-path hard rule fails the gate no matter what the metrics say.
   // The base ref's mandates count too (resolved through `extends` by gateDefAtRef), so a change
   // cannot clear a mandate by deleting it in the same diff that violates it.
   const baseMandates = (gateInfo && gateInfo.baseMandates) || (!opts.detectGaming ? ((gateDefAtRef(repo, base) || {}).scalars || {}).mandates : null);
@@ -854,7 +962,6 @@ function gate(repo, opts) {
     configHash: gateFingerprint(cfg.metrics, cfg),
     verdictHash: verdictFingerprint(report),
   };
-  if (!opts.noRecord && cfg.record !== false) recordOutcome(repo, report);
   return report;
 }
 
@@ -866,96 +973,11 @@ function run(argv) {
     config = autoConfig(repo);
     console.error(`no promptwheel.config.json, auto-gating the detected test command: ${config.metrics[0].cmd}  (promptwheel init to customize; --no-auto to require a config)`);
   }
-  const report = gate(repo, { base: args.base, head: args.head, working: args.working, repeat: args.repeat, noRecord: args.noRecord, detectGaming: args.detectGaming, allow: args.allow, config });
+  const report = gate(repo, { base: args.base, head: args.head, working: args.working, repeat: args.repeat, detectGaming: args.detectGaming, allow: args.allow, config });
   if (args.json) console.log(JSON.stringify(report, null, 2));
   else if (args.markdown) console.log(renderMarkdown(report));
   else printHuman(report);
   process.exit(verdictExitCode(report.verdict));
-}
-
-// persisted record: append every gated run to a per-repo outcome record (best-effort, never fails the gate)
-function recordOutcome(repo, report) {
-  try {
-    const dir = join(repo, '.promptwheel');
-    mkdirSync(dir, { recursive: true });
-    appendFileSync(join(dir, 'outcomes.jsonl'), JSON.stringify({ ts: new Date().toISOString(), ...report }) + '\n');
-  } catch { /* recording must never break the gate */ }
-}
-
-// keep-if-improved: run any agent/script, gate the result, keep the change ONLY if a metric improved
-function improve(argv) {
-  const args = parseArgs(argv);
-  if (!args.attempt) die('improve requires --attempt "<command that changes the repo>"');
-  const repo = repoRoot(process.cwd());
-  const dirty = git(['status', '--porcelain'], repo).split('\n').filter((l) => l.trim() && !l.includes('.promptwheel'));
-  if (dirty.length) die('working tree not clean, commit or stash first (improve needs a clean base to revert to)');
-
-  console.error(`▶ attempt: ${args.attempt}`);
-  try { execSync(args.attempt, { cwd: repo, stdio: 'inherit' }); }
-  catch (e) { console.error(`  (attempt exited ${e.status ?? 1}, gating whatever it changed)`); }
-
-  const report = gate(repo, { working: true, repeat: args.repeat, noRecord: args.noRecord, detectGaming: args.detectGaming });
-  const noChange = report.metrics.every((m) => m.delta === 0 || m.delta == null);
-  const improvedNames = report.metrics.filter((m) => m.status === 'improved').map((m) => m.name);
-
-  // result + exit code express loop progress so `while improve; do :; done` converges, with the
-  // same codes as `run`: 0 = kept a real win · 1 = guarded regression (reverted) · 2 = gamed
-  // (reverted) · 3 = plateau/no-op OR inconclusive (reverted)
-  let result, exit, note;
-  if (report.verdict === 'fail') { result = 'regression'; exit = 1; revert(repo); note = '✗ guarded regression, reverted'; }
-  else if (report.verdict === 'gamed') { result = 'gamed'; exit = 2; revert(repo); note = '🚩 gamed, a metric "improved" by editing tests/config, not source, reverted'; }
-  else if (report.verdict === 'inconclusive') { result = 'inconclusive'; exit = 3; revert(repo); note = '≈ inconclusive, a guard measured nothing (inert); reverted'; }
-  else if (noChange || improvedNames.length === 0) {
-    result = 'plateau'; exit = 3; revert(repo);
-    note = noChange ? '= no metric moved, reverted' : '= nothing improved beyond noise, reverted';
-  } else {
-    git(['add', '-A'], repo);
-    execFileSync('git', ['commit', '-qm', `promptwheel: ${args.attempt} [improved ${improvedNames.join(', ')}]`], { cwd: repo });
-    result = 'kept'; exit = 0;
-    note = `✓ kept, committed ${git(['rev-parse', '--short', 'HEAD'], repo)} (improved ${improvedNames.join(', ')})`;
-  }
-
-  // stdout carries the value (JSON report or the human table); the decision line goes to
-  // stderr so a loop driver can consume clean stdout.
-  if (args.json) console.log(JSON.stringify({ result, ...report }, null, 2));
-  else printHuman(report);
-  console.error(`  ${note}`);
-  process.exit(exit);
-}
-
-// discard the attempt's changes; keep the .promptwheel outcome record
-function revert(repo) {
-  git(['reset', '--hard', 'HEAD'], repo);
-  try { git(['clean', '-fd', '-e', '.promptwheel'], repo); } catch { /* best effort */ }
-}
-
-// insights: honest aggregation of the per-repo outcome record (.promptwheel/outcomes.jsonl)
-// into per-metric counts. No model, no decay, no claims: just which metrics actually respond.
-// The reader is tolerant of older records that carry extra fields (cohort, label, subsystems).
-function insights(argv) {
-  const args = parseArgs(argv);
-  const repo = repoRoot(process.cwd());
-  const f = join(repo, '.promptwheel', 'outcomes.jsonl');
-  if (!existsSync(f)) die('no outcome record yet, run the gate a few times first (.promptwheel/outcomes.jsonl)');
-  const runs = readFileSync(f, 'utf8').split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-  const agg = {};
-  for (const r of runs) for (const m of (r.metrics || [])) {
-    const a = agg[m.name] ??= { runs: 0, improved: 0, regressed: 0, inconclusive: 0, unchanged: 0, net: 0, last: null };
-    a.runs++; if (a[m.status] != null) a[m.status]++;
-    if (typeof m.delta === 'number') a.net = +(a.net + m.delta).toFixed(6);
-    a.last = m.after;
-  }
-  // "lever score" = how reliably acting on this metric yields a real improvement
-  const rows = Object.entries(agg).map(([name, a]) => ({ name, ...a, lever: a.runs ? a.improved / a.runs : 0 }))
-    .sort((x, y) => y.lever - x.lever);
-  if (args.json) { console.log(JSON.stringify({ runs: runs.length, metrics: rows }, null, 2)); return; }
-  console.log(`\nPromptWheel insights, ${runs.length} gated runs recorded\n`);
-  console.log(`  ${'metric'.padEnd(18)} ${'runs'.padStart(5)} ${'impr'.padStart(5)} ${'regr'.padStart(5)} ${'inconc'.padStart(6)} ${'net Δ'.padStart(9)}  lever`);
-  for (const r of rows) {
-    console.log(`  ${r.name.padEnd(18)} ${String(r.runs).padStart(5)} ${String(r.improved).padStart(5)} ${String(r.regressed).padStart(5)} ${String(r.inconclusive).padStart(6)} ${String(r.net).padStart(9)}  ${(r.lever * 100).toFixed(0)}%`);
-  }
-  console.log('\n  lever = improved/runs, how reliably this metric actually responds. The');
-  console.log('  highest-lever metrics are where an agent loop should spend its attempts.\n');
 }
 
 // ---------------------------------------------------------------------------
@@ -963,18 +985,6 @@ function insights(argv) {
 // ---------------------------------------------------------------------------
 const LINT_CMD = 'npx eslint . -f unix 2>/dev/null | grep -c " error " || true';
 const PRESETS = {
-  'tests-pass': { desc: 'gate: your test suite still passes (command auto-detected)', metrics: null },
-  'lint': { desc: 'track: lint error count does not climb',
-    metrics: [{ name: 'lint_errors', cmd: LINT_CMD, extract: 'number', direction: 'down', guard: false }] },
-  'bundle-size': { desc: 'track: build output size in kB',
-    metrics: [{ name: 'bundle_kb', cmd: 'du -sk dist 2>/dev/null | cut -f1 || echo 0', extract: 'number', direction: 'down', guard: false }] },
-  'security': { desc: 'gate: security-invariant violations must not climb (CORS, secrets, cookies, payment; see packs/security)',
-    metrics: [{ name: 'security_findings', cmd: 'node packs/security/scan.mjs .', extract: 'number', direction: 'down', guard: true }] },
-  'llm-eval': { desc: 'gate: AI-feature eval pass-rate + est $/run (see examples/reliability-sprint)',
-    metrics: [
-      { name: 'eval_pass_rate', cmd: 'node eval.mjs', extract: 'number', direction: 'up', guard: true },
-      { name: 'cost_per_run_usd', cmd: 'node estimate-cost.mjs', extract: 'number', direction: 'down', guard: true },
-    ] },
   'antihack': { desc: 'catch reward-hacking: a target + tripwires; pairs with `run --detect-gaming` (source-only re-run)',
     metrics: [
       { name: 'tests_pass', cmd: '__TESTCMD__', extract: 'exit', direction: 'pass', guard: true },
@@ -1004,7 +1014,7 @@ const PRESETS = {
       { name: 'codeowners-frozen', paths: ['CODEOWNERS'], reason: 'review ownership is set by people' },
       { name: 'scanner-frozen', paths: ['.promptwheel/packs/**'], reason: 'the scanners that read the contract are not edited by the change they read' },
       { name: 'lock-frozen', paths: ['promptwheel.lock.json'], allowable: 'flag', reason: 'the architecture lock changes with a reason from a person (--allow), never as a side effect of a change' },
-      { name: 'hooks-frozen', paths: ['.claude/settings.json', '.claude/settings.local.json', '.sawbuck/**'], reason: 'the hooks that enforce the contract are wired by a person, not detached by the agent' },
+      { name: 'hooks-frozen', paths: ['.claude/settings.json', '.claude/settings.local.json', '.sawbuck/**'], allowable: 'flag', reason: 'the hooks that enforce the contract change with a reason from a person (--allow), and are never detached by the agent' },
     ],
     metrics: [
       { name: 'lifecycle_scripts', cmd: 'node packs/supply-chain/scan.mjs lifecycle .', extract: 'number', direction: 'down', guard: true, gamingCheck: false, allowable: 'flag' },
@@ -1017,32 +1027,17 @@ const PRESETS = {
     ] },
 };
 
-// security-antihack = the security-invariant findings gate + the SAME antihack tripwires
-// (so an agent that suppresses a security rule, # noqa / # nosec / eslint-disable, or
-// skips a security test is caught), PLUS a starter `evaluatorPaths` that protects common
-// security-gate config files (a ruleset or a budget the agent could otherwise loosen to
-// pass). The scanner pack installs into `.promptwheel/` (already evaluator-protected). It
-// is the "guard the guards" preset: pairs with --detect-gaming so a win that only moved by
-// loosening the security gate, not by fixing the code, is GAMED. Blind spot (by design,
-// not this tool's job): a source-resident backdoor that behaves safely only under test;
-// that needs held-out/behavioral analysis, not a source-only re-run.
-PRESETS['security-antihack'] = {
-  desc: 'gate security-invariant findings + antihack tripwires + evaluatorPaths so an agent cannot loosen the security gate to pass it (pairs with --detect-gaming)',
-  evaluatorPaths: ['.semgrep.yml', '.semgrep.yaml', '.bandit', 'bandit.yaml', '.ruff.toml', 'ruff.toml', '.snyk', 'security-budget.json'],
-  metrics: [{ name: 'security_findings', cmd: 'node packs/security/scan.mjs .', extract: 'number', direction: 'down', guard: true }, ...PRESETS.antihack.metrics.slice(1)],
-};
-
-function detectTestCmd(repo) {
-  const has = (f) => existsSync(join(repo, f));
+function detectTestCmd(repo, { has, read } = stackAt(repo)) {
   if (has('go.mod')) return 'go test ./...';
   if (has('Cargo.toml')) return 'cargo test';
-  if (has('pyproject.toml') || has('setup.py') || has('pytest.ini')) return has('.venv/bin/pytest') ? '.venv/bin/pytest -q' : 'pytest -q';
+  // the venv is not tracked: it is looked for on disk whichever ref the stack is read from
+  if (has('pyproject.toml') || has('setup.py') || has('pytest.ini')) return existsSync(join(repo, '.venv/bin/pytest')) ? '.venv/bin/pytest -q' : 'pytest -q';
   // only trust `npm test` when a test script actually exists, otherwise the metric can
   // never pass and the gate would "protect" nothing (very common in Next.js app repos)
   try {
-    if (JSON.parse(readFileSync(join(repo, 'package.json'), 'utf8')).scripts?.test) return 'npm test --silent';
+    if (JSON.parse(read('package.json')).scripts?.test) return 'npm test --silent';
   } catch { /* no or unparsable package.json, fall through */ }
-  return 'echo "set your test command in promptwheel.config.json" && false';
+  return PLACEHOLDER_TEST;
 }
 
 // deps that live outside git + the env a test needs, defaulted per stack. init writes these into
@@ -1051,18 +1046,16 @@ function detectTestCmd(repo) {
 // where the detected test command cannot run without a build first (a 10-repo replay put this at
 // ~2/3 of gates). Written by `init` into `setup`; a failed setup stays honest (inert -> inconclusive,
 // never a fake green). Kept out of the zero-config default so the fast per-turn path stays fast.
-function detectSetup(repo) {
-  const has = (f) => existsSync(join(repo, f));
+function detectSetup(repo, { has, read } = stackAt(repo)) {
   try {
-    const pkg = JSON.parse(readFileSync(join(repo, 'package.json'), 'utf8'));
+    const pkg = JSON.parse(read('package.json'));
     if (pkg.scripts && pkg.scripts.build) return 'npm run build --if-present';   // TS/bundler tests that run against a built dir
   } catch { /* no or unparsable package.json */ }
   if (has('pyproject.toml') || has('setup.py')) return 'pip install -e . --quiet 2>/dev/null || true';   // editable install so imports resolve the measured ref
   return undefined;
 }
 
-function detectEnv(repo) {
-  const has = (f) => existsSync(join(repo, f));
+function detectEnv(repo, { has } = stackAt(repo)) {
   // Python: link the venv (3rd-party deps) and put the worktree src FIRST on PYTHONPATH, so imports
   // resolve the MEASURED ref instead of an editable install pointing back at your original checkout.
   if (has('pyproject.toml') || has('setup.py') || has('pytest.ini')) return { linkDirs: ['.venv'], env: { PYTHONPATH: '{wt}/src:{wt}' } }; // src/ AND flat layouts; worktree src wins over an editable install
@@ -1104,10 +1097,9 @@ function init(argv) {
   if (presetName) {
     const p = PRESETS[presetName];
     if (!p) die(`unknown preset "${presetName}", try: promptwheel init --list`);
-    evaluatorPaths = p.evaluatorPaths;   // a preset may ship a starter evaluator allowlist (e.g. security-antihack)
+    evaluatorPaths = p.evaluatorPaths;   // a preset may ship a starter evaluator allowlist (supply-chain: the contract)
     mandates = p.mandates; allowTrailer = p.allowTrailer;               // a preset may ship hard rules (supply-chain: workflows, registries, publish scripts, hooks)
-    metrics = p.metrics || [{ name: 'tests_pass', cmd: detectTestCmd(repo), extract: 'exit', direction: 'pass', guard: true }];
-    metrics = metrics.map((m) => m.cmd === '__TESTCMD__' ? { ...m, cmd: detectTestCmd(repo) } : m); // fill the preset's target
+    metrics = p.metrics.map((m) => m.cmd === '__TESTCMD__' ? { ...m, cmd: detectTestCmd(repo) } : m); // fill the preset's target
     // pack-backed presets: the referenced scripts live in THIS package, not
     // the user's repo, copy them in so the generated config is
     // self-contained and committable (a bare reference silently 404'd)
@@ -1123,8 +1115,7 @@ function init(argv) {
       const files = readdirSync(src);
       for (const f of files) copyFileSync(join(src, f), join(dst, f));
       console.log(`  ✓ installed ${pk[2]} → .promptwheel/${pk[2]} (commit it with the config)`);
-      // the gate measures in clean worktrees, so a pack that git ignores (common: the outcome
-      // record lives in .promptwheel/ too) is absent at both refs and the metric reads
+      // the gate measures in clean worktrees, so a pack that git ignores is absent at both refs and the metric reads
       // unmeasurable, failing the guard with no hint why. Say so now, while it is one edit.
       if (files.length && gitIgnores(repo, `.promptwheel/${pk[2]}/${files[0]}`))
         console.log(`  ⚠ .promptwheel/${pk[2]} is gitignored: the gate measures in clean worktrees, so an ignored pack is absent at both refs and ${m.name} reads unmeasurable (the guard fails). Replace ".promptwheel/" in .gitignore with ".promptwheel/*" and "!.promptwheel/packs/", then commit the pack`);
@@ -1154,7 +1145,7 @@ function init(argv) {
     if (wrote.length) console.log(`✓ wrote the agent guide (when to run the gate) to ${wrote.join(', ')}`);
   }
   console.log('\n  next:  promptwheel run --working   # gate your uncommitted changes');
-  console.log('         promptwheel init --list     # other presets (llm-eval, bundle-size, …)');
+  console.log('         promptwheel init --list     # other presets (antihack, no-ai-tells, supply-chain)');
 }
 
 // Write (or refresh) a short agent-orienting block so the coding AGENT runs the gate itself, not just
@@ -1177,36 +1168,9 @@ function writeAgentBlock(repo) {
   return done;
 }
 
-// observability: list the EFFECTIVE guardrails (incl. inherited) + each one's flag record
-function guards(argv) {
-  const args = parseArgs(argv);
-  const repo = repoRoot(process.cwd());
-  const cfg = loadConfig(repo);
-  const hist = {};
-  const f = join(repo, '.promptwheel', 'outcomes.jsonl');
-  if (existsSync(f)) for (const line of readFileSync(f, 'utf8').split('\n').filter(Boolean)) {
-    let r; try { r = JSON.parse(line); } catch { continue; }
-    for (const m of (r.metrics || [])) {
-      const h = hist[m.name] ??= { runs: 0, flagged: 0, last: null };
-      h.runs++; if (m.guard && m.ok === false) h.flagged++; h.last = m.status;
-    }
-  }
-  const rows = cfg.metrics.map((m) => ({
-    name: m.name, direction: m.direction || 'up', guard: !!m.guard,
-    source: m.__src, override: !!m.__override, ...(hist[m.name] || { runs: 0, flagged: 0, last: null }),
-  }));
-  if (args.json) { console.log(JSON.stringify({ guards: rows }, null, 2)); return; }
-  console.log('\nPromptWheel guardrails, effective set for this repo\n');
-  for (const r of rows) {
-    const prov = r.override ? 'local override' : (r.source === 'local' ? 'local' : `inherited ← ${r.source}`);
-    const rec = r.guard ? (r.runs ? `· ${r.flagged} flagged / ${r.runs} runs` : '· no runs yet') : '';
-    console.log(`  ${r.guard ? '🛡️  GUARD' : '·   info '}  ${r.name.padEnd(18)} better=${r.direction.padEnd(5)}  [${prov}]  ${rec}`);
-  }
-  console.log('\n  🛡️ = enforced (a trusted regression fails the gate) · info = tracked only\n');
-}
-
 const short = (repo, ref) => { try { return git(['rev-parse', '--short', ref], repo); } catch { return ref; } };
 
+const wouldHave = (status) => (status === 'unmeasurable' ? 'been unmeasurable' : status);
 function printHuman(r) {
   const arrowFor = (m) => (m.delta == null ? '?' : m.delta > 0 ? '▲' : m.delta < 0 ? '▼' : '=');
   console.log(`\nPromptWheel  ${r.base} → ${r.head}${r.repeat > 1 ? `  (×${r.repeat})` : ''}\n`);
@@ -1215,16 +1179,22 @@ function printHuman(r) {
     const tag = m.guard ? (m.ok ? 'guard✓' : 'GUARD✗') : 'info';
     const d = m.delta == null ? 'n/a' : (m.delta > 0 ? `+${m.delta}` : `${m.delta}`);
     console.log(`  ${arrowFor(m)} ${m.name.padEnd(18)} ${String(m.before).padStart(8)} → ${String(m.after).padStart(8)}  (${d}, ${m.status}) [${tag}, ${m.confidence}]`);
-    if (m.inert) console.log(`      ⚠ "${m.name}" never ran (same value at both refs): its command needs a build/deps first, or is not your real test command. Fix: promptwheel init, or set setup/linkDirs in promptwheel.config.json`);
+    if (m.inert && m.ran === 'both') console.log(`      ⚠ "${m.name}" ran and failed before and after this change, so it guards nothing here. Fix the failing tests, or the command, before trusting a pass`);
+    else if (m.inert) console.log(`      ⚠ "${m.name}" ${m.ran ? `ran and failed at the ${m.ran} ref and did not run at the other` : 'never ran (same value at both refs)'}: its command needs a build/deps first, or is not your real test command. Fix: promptwheel init, or set setup/linkDirs in promptwheel.config.json`);
     if (m.gamed === true) console.log(`      🚩 GAMED, ${m.gamingReason}`);
   }
-  if (r.gate && r.gate.weakened) for (const w of r.gate.weakened) console.log(`  🚩 GATE WEAKENED, the guard "${w.name}" was ${w.change === 'guard-removed' ? 'removed' : 'disabled'} in this change and it would have ${w.status} at head (goalpost moved, not earned)`);
-  if (r.gate && r.gate.changed) console.log(`  ⚠ gate definition changed in this change (fingerprint ${r.gate.fingerprint.base} -> ${r.gate.fingerprint.head}): a metric, guard, evaluatorPath or mandate was added, removed or edited; review promptwheel.config.json as part of the diff`);
+  if (r.gate && r.gate.weakened) for (const w of r.gate.weakened) console.log(w.change === 'measurement-edited'
+    ? `  🚩 GATE WEAKENED, how the guard "${w.name}" is measured (setup, env or linked dirs) was edited in this change, and measured the way it was before it would have ${wouldHave(w.status)} at head (goalpost moved, not earned)`
+    : `  🚩 GATE WEAKENED, the guard "${w.name}" was ${w.change === 'guard-removed' ? 'removed' : w.change === 'guard-edited' ? 'edited' : 'disabled'} in this change and it would have ${wouldHave(w.status)} at head (goalpost moved, not earned)`);
+  if (r.gate && r.gate.changed) console.log(`  ⚠ gate definition changed in this change (fingerprint ${r.gate.fingerprint.base} -> ${r.gate.fingerprint.head}): a metric, guard, evaluatorPath, mandate, or the setup, env or linked dirs they are measured with was added, removed or edited; review promptwheel.config.json as part of the diff`);
   const failReason = r.mandates ? ', a mandate was violated (a protected path changed)' : ', a guarded metric regressed (beyond noise)';
   console.log(`\n  VERDICT: ${r.verdict.toUpperCase()}${r.verdict === 'fail' ? failReason : r.verdict === 'gamed' ? ', a metric "improved" by editing the goalposts, not the source' : r.verdict === 'inconclusive' ? ', a guard is inert (measured nothing); a pass cannot be certified' : ''}`);
-  if (r.verdict === 'fail' && r.mandates) console.log('  a mandate is a hard rule; if the change is truly intended, edit the mandate in promptwheel.config.json (a tracked, tamper-evident change), do not work around it');
-  else if (r.verdict === 'fail' && r.metrics.some((m) => m.allowable)) console.log(`  intentional? this guard accepts a person's declared reason: promptwheel run --allow "<reason>" passes with the reason on the record (${r.metrics.filter((m) => m.allowable).map((m) => m.name).join(', ')})`);
-  else if (r.verdict === 'fail') console.log('  intentional? loosen that guard locally in promptwheel.config.json (guard:false, or override the inherited metric by name), `promptwheel guards` shows the effective set');
+  if (r.verdict === 'fail' && r.mandates) {
+    const takes = r.mandates.filter((md) => md.allowable).map((md) => `"${md.name}"`);
+    if (takes.length) console.log(`  intentional? ${takes.join(', ')} ${takes.length > 1 ? 'accept' : 'accepts'} a person's declared reason: promptwheel run --allow "<reason>" passes with the reason on the record`);
+    if (takes.length < r.mandates.length) console.log(`  ${takes.length ? 'any other' : 'a'} mandate is a hard rule; if the change is truly intended, retire the mandate in promptwheel.config.json in a change of its own first (a tracked, tamper-evident change), do not work around it`);
+  } else if (r.verdict === 'fail' && r.metrics.some((m) => m.allowable)) console.log(`  intentional? this guard accepts a person's declared reason: promptwheel run --allow "<reason>" passes with the reason on the record (${r.metrics.filter((m) => m.allowable).map((m) => m.name).join(', ')})`);
+  else if (r.verdict === 'fail') console.log('  intentional? loosen that guard locally in promptwheel.config.json (guard:false, or override the inherited metric by name)');
   if (r.allowed) console.log(`  ✓ allowed: ${r.allowed.cleared.join(', ')} acknowledged as an intentional change, recorded (Promptwheel-Allow: ${r.allowed.reason})`);
   console.log('');
 }
@@ -1277,9 +1247,10 @@ function renderMarkdown(r) {
     '|---|--:|--:|--:|---|---|',
     rows,
     '',
-    r.verdict === 'gamed' ? '> 🚩 A metric "improved" only because the agent edited tests/config/grader, not the source. The win does not survive a source-only re-run.' : r.verdict === 'fail' ? (r.mandates ? '> ⛔ A protected path changed. This is a hard rule, enforced before any metric.' : '> ❌ A 🛡️ guarded metric regressed beyond the noise band.') : r.verdict === 'inconclusive' ? '> 🟡 A 🛡️ guarded check is **inert**, it never runs, so nothing was actually verified. Fix its command before trusting a pass.' : '> ✅ No guarded metric regressed.',
-    ...(r.gate && r.gate.weakened ? ['', `> 🚩 **Gate weakened:** ${r.gate.weakened.map((w) => `\`${w.name}\` ${w.change === 'guard-removed' ? 'removed' : 'disabled'} (would have ${w.status} at head)`).join('; ')}. The pass was bought by dropping a guard, not by earning it.`] : []),
-    ...(r.gate && r.gate.changed ? ['', `> ⚠ **Gate definition changed** in this diff (fingerprint \`${r.gate.fingerprint.base}\` -> \`${r.gate.fingerprint.head}\`): a metric, guard, evaluatorPath or mandate was added, removed or edited. Review the config change with the code.`] : []),
+    r.verdict === 'gamed' ? '> 🚩 A metric "improved" only because the agent edited tests/config/grader, not the source. The win does not survive a source-only re-run.' : r.verdict === 'fail' ? (r.mandates ? '> ⛔ A protected path changed. This is a hard rule; no metric result clears it.' : '> ❌ A 🛡️ guarded metric regressed beyond the noise band.') : r.verdict === 'inconclusive' ? (r.metrics.some((m) => m.inert) && r.metrics.every((m) => !m.inert || m.ran === 'both') ? '> 🟡 A 🛡️ guarded check is **inert**, it fails before and after this change, so nothing was actually verified. Fix it before trusting a pass.' : '> 🟡 A 🛡️ guarded check is **inert**, it never runs, so nothing was actually verified. Fix its command before trusting a pass.') : '> ✅ No guarded metric regressed.',
+    ...(r.gate && r.gate.weakened ? ['', `> 🚩 **Gate weakened:** ${r.gate.weakened.map((w) => `\`${w.name}\` ${w.change === 'guard-removed' ? 'removed' : w.change === 'guard-edited' ? 'edited' : w.change === 'measurement-edited' ? 'measured another way (setup, env or linked dirs)' : 'disabled'} (would have ${wouldHave(w.status)} at head)`).join('; ')}. The pass was bought by changing the gate, not by earning it.`] : []),
+    ...(r.allowed ? ['', `> ✓ **Allowed:** \`${r.allowed.cleared.join('`, `')}\` cleared by a declared reason: ${r.allowed.reason}`] : []),
+    ...(r.gate && r.gate.changed ? ['', `> ⚠ **Gate definition changed** in this diff (fingerprint \`${r.gate.fingerprint.base}\` -> \`${r.gate.fingerprint.head}\`): a metric, guard, evaluatorPath, mandate, or the setup, env or linked dirs they are measured with was added, removed or edited. Review the config change with the code.`] : []),
     '',
     '<sub>🛡️ = guard · _prove every change moved a metric_ · [PromptWheel](https://github.com/promptwheel-ai/promptwheel)</sub>',
   ].join('\n');
@@ -1292,12 +1263,10 @@ function parseArgs(argv) {
     else if (argv[i] === '--head') a.head = argv[++i];
     else if (argv[i] === '--repeat') a.repeat = parseInt(argv[++i], 10);
     else if (argv[i] === '--working') a.working = true;
-    else if (argv[i] === '--no-record') a.noRecord = true;
     else if (argv[i] === '--no-auto') a.noAuto = true;
     else if (argv[i] === '--allow') a.allow = argv[++i];
     else if (argv[i] === '--detect-gaming') a.detectGaming = true;
     else if (argv[i] === '--no-detect-gaming') a.detectGaming = false;
-    else if (argv[i] === '--attempt') a.attempt = argv[++i];
     else if (argv[i] === '--json') a.json = true;
     else if (argv[i] === '--markdown') a.markdown = true;
   }
@@ -1314,7 +1283,7 @@ export { extract, evaluate, median, spread, renderMarkdown, isNonSource, evaluat
 // Importing this file never runs the CLI (see the isMain guard at the bottom).
 // Stable across 0.x minor versions. The schema check() returns and the exit codes
 // verdictExitCode() maps are specified in CONTRACT.md; integration paths (conform,
-// shell, import, MCP) are in INTEGRATE.md.
+// shell, import) are in INTEGRATE.md.
 // ─────────────────────────────────────────────────────────────────────────────
 
 // The contract revision this build implements (CONTRACT.md "Versioning"). Bumps only
@@ -1351,10 +1320,9 @@ export function verdictExitCode(verdict) {
 //   repeat        number   measurement repeats for the noise band (default: config.repeat ?? 1)
 //   detectGaming  boolean  run the Section 3 source-only re-proof (default: true)
 //   allow         string   a declared override reason (same as --allow / a Promptwheel-Allow: trailer)
-//   record        boolean  append the run to .promptwheel/outcomes.jsonl (default: false)
 export function check(options = {}) {
-  // `repo` may name a subdirectory: the gate runs at the toplevel (that is where the config lives
-  // and where .promptwheel/ is written), exactly as the CLI does from the same directory
+  // `repo` may name a subdirectory: the gate runs at the toplevel (that is where the config
+  // lives), exactly as the CLI does from the same directory
   let start = process.cwd();
   if (options.repo) { try { start = realpathSync(options.repo); } catch { bad(`promptwheel: not inside a git repository (${options.repo})`); } }
   const repo = repoRoot(start);
@@ -1376,7 +1344,6 @@ export function check(options = {}) {
     repeat: options.repeat,
     detectGaming: options.detectGaming ?? true,
     allow: options.allow,
-    noRecord: options.record !== true,
   });
 }
 
@@ -1466,70 +1433,42 @@ export function conformsToContract(report) {
   return { ok: errors.length === 0, errors };
 }
 
-// `promptwheel conformance [file.json | -] [--cmd "<command>"]`
-// Self-check a Contract implementation. With a file or stdin, validate that verdict JSON
-// against the Section 2 schema. With --cmd, run the command, then validate its --json
-// stdout (Section 2) AND that its exit code matches the verdict per Section 1. Exit 0 if
-// it conforms, 1 otherwise, listing every problem.
-function conformance(argv) {
-  let cmd = null, src = null;
-  for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === '--cmd') cmd = argv[++i];
-    else if (argv[i] === '-' || !argv[i].startsWith('-')) src = argv[i];
-  }
-
-  let text, exitCode = null;
-  if (cmd) {
-    try { text = execFileSync('sh', ['-c', cmd], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }); exitCode = 0; }
-    catch (e) {
-      text = (e.stdout || '').toString();
-      exitCode = typeof e.status === 'number' ? e.status : null;
-      if (!text) { console.error(`conformance: command produced no stdout (exit ${exitCode}): ${e.message}`); process.exit(1); }
-    }
-  } else {
-    const file = src && src !== '-' ? src : 0; // fd 0 = stdin
-    try { text = readFileSync(file, 'utf8'); }
-    catch (e) { console.error(`conformance: cannot read ${!src || src === '-' ? 'stdin' : src}: ${e.message}`); process.exit(1); }
-  }
-
-  let report;
-  try { report = JSON.parse(text); }
-  catch (e) { console.error(`conformance: not valid JSON: ${e.message}`); process.exit(1); }
-
-  const { errors } = conformsToContract(report);
-  const problems = [...errors];
-  if (cmd && exitCode !== null && VERDICTS.includes(report.verdict)) {
-    const want = verdictExitCode(report.verdict);
-    if (exitCode !== want) problems.push(`exit code ${exitCode} does not match verdict '${report.verdict}' (Section 1 requires ${want})`);
-  }
-
-  if (problems.length === 0) {
-    console.log(`ok, conforms to the Verified-Outcome Contract v${CONTRACT_VERSION} (verdict: ${report.verdict}${cmd ? `, exit ${exitCode}` : ''})`);
-    process.exit(0);
-  }
-  console.error(`does NOT conform to the Contract (${problems.length} problem${problems.length > 1 ? 's' : ''}):`);
-  for (const p of problems) console.error(`  - ${p}`);
-  process.exit(1);
-}
-
 // the flags each command accepts. An unknown --flag is a usage error (exit 64), never silently
 // ignored: a typo in a CI step must not turn `--no-detect-gaming` into the default gate or `--allow`
 // into nothing, and INTEGRATE.md promises a bad flag exits 64. A flag that takes a value consumes
-// the next argument; anything not starting with `-` (or a bare `-`, stdin for conformance) is positional.
+// the next argument; anything not starting with `-` is positional. --no-record does nothing now that
+// no record is written, and stays accepted because Sawbuck and existing CI steps pass it.
 const GATE_FLAGS = ['--base', '--head', '--repeat', '--working', '--no-record', '--no-auto', '--allow', '--detect-gaming', '--no-detect-gaming', '--json', '--markdown'];
 const COMMAND_FLAGS = {
-  run: GATE_FLAGS, improve: [...GATE_FLAGS, '--attempt'], insights: ['--json'], guards: ['--json'],
-  init: ['--preset', '--list', '--force', '--no-agent-block'], conformance: ['--cmd'], lock: [],
+  run: GATE_FLAGS, init: ['--preset', '--list', '--force', '--no-agent-block'], lock: [],
 };
-const VALUED_FLAGS = new Set(['--base', '--head', '--repeat', '--allow', '--attempt', '--preset', '--cmd']);
+// what each valued flag needs. A missing or unusable value is a usage error too: `--repeat abc` must not
+// measure nothing and read FAIL, and `--allow` with nothing after it must not run as if no reason was asked for.
+const VALUED_FLAGS = { '--base': 'a ref', '--head': 'a ref', '--repeat': 'a whole number, 1 or more', '--allow': 'a reason, e.g. --allow "the spec changed"', '--preset': 'a preset name (see promptwheel init --list)' };
 function checkFlags(cmd, argv) {
   const known = new Set(COMMAND_FLAGS[cmd]);
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === '-' || !a.startsWith('-')) continue;
+    if (!a.startsWith('-')) continue;
     if (!known.has(a)) bad(`promptwheel ${cmd}: unknown flag ${a} (see promptwheel --help)`);
-    if (VALUED_FLAGS.has(a)) i++;
+    if (!(a in VALUED_FLAGS)) continue;
+    const v = argv[++i];
+    const gone = v === undefined || known.has(v);   // nothing after the flag, or the next flag
+    // an empty --base or --head is the default ref: the Action passes an empty base outside a pull request
+    const blank = !gone && !v.trim() && !(v === '' && (a === '--base' || a === '--head'));
+    if (gone || blank) bad(`promptwheel ${cmd}: ${a} needs ${VALUED_FLAGS[a]}`);
+    if (a === '--repeat' && !/^[1-9]\d*$/.test(v)) bad(`promptwheel ${cmd}: --repeat needs ${VALUED_FLAGS[a]} (got "${v}")`);
   }
+}
+
+// read PR comments on stdin: a JSON array, or one comment per line as `gh api --paginate --jq '.[]'` prints every
+// page. Streamed: readFileSync(0) corrupted the heap on Node 24.22 reading a live paginated gh pipe.
+async function prAllow() {
+  let t = ''; process.stdin.setEncoding('utf8');
+  for await (const chunk of process.stdin) t += chunk;
+  t = t.trim(); let c = [];
+  try { c = [].concat(JSON.parse(t || '[]')); } catch { try { c = t.split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { /* unreadable, no approval */ } }
+  process.stdout.write(allowFromComments(c));
 }
 
 // write or refresh the architecture lock from the tree as it stands. A person runs this: the lock file is
@@ -1546,13 +1485,9 @@ function dispatch() {
   const cmd = (rest.includes('--help') || rest.includes('-h')) ? 'help' : first;   // `promptwheel run --help` is a help request, not a gate run
   if (cmd in COMMAND_FLAGS) checkFlags(cmd, rest);
   if (cmd === 'run') run(rest);
-  else if (cmd === 'improve') improve(rest);
-  else if (cmd === 'pr-allow') { let c = []; try { c = JSON.parse(readFileSync(0, 'utf8') || '[]'); } catch { /* no comments, no approval */ } process.stdout.write(allowFromComments(c)); }
-  else if (cmd === 'insights') insights(rest);
+  else if (cmd === 'pr-allow') return prAllow();
   else if (cmd === 'init') init(rest);
-  else if (cmd === 'guards') guards(rest);
-  else if (cmd === 'conformance') conformance(rest);
-  else if (cmd === 'lock') lock(rest);
+  else if (cmd === 'lock') return lock(rest);
   else {
     const help = !cmd || cmd === '--help' || cmd === '-h' || cmd === 'help';
     if (!help) console.error(`unknown command: ${cmd}`);
@@ -1567,16 +1502,11 @@ function dispatch() {
       '       catches reward-hacking BY DEFAULT, re-proves each win from SOURCE edits alone (verdict GAMED,',
       '       exit 2, when a metric only moved by editing tests/config/grader). Use --no-detect-gaming for the bare gate.',
       '  promptwheel run --working                    gate uncommitted changes (incl. newly added files)',
+      '  promptwheel pr-allow < comments.json         print the newest `sawbuck-allow: <reason>` from a PR comment by someone with write access (the Action uses it)',
       '  promptwheel run --allow "<reason>"           acknowledge an intentional test/config change (or a `Promptwheel-Allow: <reason>` commit trailer; `Sawbuck-Allow:` is an alias): recorded, not flagged GAMED',
-      '  promptwheel improve --attempt "<cmd>"        run an agent/script; keep only if a metric improved',
-      '                                               exit 0=kept · 1=regression · 2=gamed · 3=plateau/inconclusive (all but 0 reverted) · add --json',
-      '  promptwheel insights [--json]                which metrics actually respond (raw counts from .promptwheel/outcomes.jsonl)',
-      '  promptwheel guards [--json]                  show the effective guardrails (incl. inherited) + flag record',
-      '  promptwheel conformance [file|-] [--cmd C]   check a verdict JSON (or a command) against the Contract (exit 0 = conforms)',
       '',
       'Exit codes: 0 pass · 1 fail (a guarded metric regressed, or a mandate was violated) · 2 gamed · 3 inconclusive · 64 usage or config error (never a verdict).',
-      'Integrate (library / conform / shell / MCP): see INTEGRATE.md. Import: `import { check } from \'promptwheel\'`.',
-      'Loop it:  while promptwheel improve --attempt "$AGENT"; do :; done   # stops on plateau/regression',
+      'Integrate (library / conform / shell): see INTEGRATE.md. Import: `import { check } from \'promptwheel\'`.',
       'Config:   promptwheel.config.json → { extends?, metrics:[{ name, cmd, direction, extract?, guard? }] }   (or: promptwheel init)',
       '          extends: a path (or array) to a shared base config, repos INHERIT its guardrails; local metrics override by name.',
     ].join('\n'));
@@ -1587,8 +1517,8 @@ function dispatch() {
 // run the CLI only when invoked directly (resolves symlinks so the npm bin still works)
 let isMain = false;
 try { isMain = !!process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url)); } catch { /* not main */ }
-function main() {
-  try { dispatch(); }
+async function main() {
+  try { await dispatch(); }
   catch (e) { if (e && e.name === 'ConfigError') die(e.message); throw e; }
 }
 if (isMain) main();

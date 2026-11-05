@@ -50,7 +50,7 @@ importing this package.
       "gamed": true,
       "sourceOnly": null,
       "retained": 0.0,
-      "gamingReason": "the win changed zero production-source files, only test/config/grader/golden"
+      "gamingReason": "the \"win\" changed zero production-source files, only test/config/grader/golden"
     }
   ]
 }
@@ -68,15 +68,18 @@ metric's gain that survived the source-only re-run (Section 3). `confidence`
 (`none | unverified | low | medium | high`, `none` for an unmeasurable metric) and `sourceOnly` are informational fields this
 implementation adds; a minimal conforming report may omit them. `gate` (optional) records a
 truncated SHA-256 fingerprint of the gate definition (metrics, guards, `evaluatorPaths`,
-`gamingThreshold`, `mandates`) at base and head, sets `gate.changed: true` when they differ,
-and lists any guard the change dropped to hide a regression; a non-empty `gate.weakened`
-forces `gamed`, so an agent cannot pass by disabling the guard it is judged by.
+`gamingThreshold`, `mandates`, `setup`, `env`, linked dirs; each metric with its `cmd` and how it
+is read) at base and head, sets `gate.changed: true` when they differ, and lists in
+`gate.weakened` any guard the change removed, disabled, or measured another way
+(`change: guard-edited`, such as `cmd: "true"`; `change: measurement-edited`, a new `setup`, `env`
+or `linkDirs`) to hide a regression; a non-empty `gate.weakened` forces `gamed`, so an agent
+cannot pass by disabling the guard it is judged by. A change that adds the first config is
+compared with the zero-config gate (the detected test command). `allowed` (optional) is `{ reason, cleared }` when a declared
+reason turned a would-be `gamed`, `fail` or `inconclusive` into `pass`: `cleared` names each metric,
+`gate`, or `mandate:<name>` it cleared, and each cleared metric carries `allowed: true` and keeps its
+`gamingReason`, so a consumer can say what was allowed and why it would have failed.
 
-Self-check your implementation against this schema (see Section 4 below):
-
-```bash
-your-tool --json | promptwheel conformance -
-```
+Self-check your implementation against this schema with `conformsToContract` (see part 4 below).
 
 ---
 
@@ -103,8 +106,8 @@ measurement runs in a throwaway git worktree.
 ## 3. Import the library (in process)
 
 Zero dependencies, no build step, the whole engine is one file. `check()` runs the gate in
-process and returns the Section 2 object. It never prints and never calls `process.exit`; it
-throws a plain `Error` on a precondition failure. Types ship in the package
+process and returns the Section 2 object. It never prints and never calls `process.exit`; on a
+precondition failure it throws an `Error` named `ConfigError` with `exitCode` 64. Types ship in the package
 (`bin/promptwheel.d.ts`, hand-written, no build step): `import type { Report, CheckOptions, Config } from 'promptwheel'`
 works in TypeScript, and editors complete the options and the report in plain JavaScript.
 
@@ -135,7 +138,6 @@ Returns the Section 2 verdict object (identical to `run --json`). Reproducible f
 | `repeat` | number | `config.repeat ?? 1` | measurement repeats for the noise band |
 | `detectGaming` | boolean | `true` | run the Section 3 source-only re-proof |
 | `allow` | string | none | a declared override reason (the same as `--allow` / a `Promptwheel-Allow:` trailer): a would-be `gamed`, or an `unprovable` win (its source-only re-run could not be applied), reads `pass` with the reason recorded in `report.allowed` |
-| `record` | boolean | `false` | append the run to `.promptwheel/outcomes.jsonl` |
 
 Preconditions throw (they do not exit the host): not inside a git repository; `auto: false`
 with no `promptwheel.config.json` and no `config` option; a `config` with no non-empty
@@ -173,22 +175,19 @@ of truth instead of hardcoding the strings.
 
 ---
 
-## 4. Self-check with `promptwheel conformance`
+## 4. Self-check with `conformsToContract`
 
 Prove your own check, loop, or CI step speaks the Contract.
 
-```bash
-# validate a verdict JSON (from a file or stdin) against the Section 2 schema
-promptwheel conformance report.json
-cat report.json | promptwheel conformance -
+```js
+import { conformsToContract, verdictExitCode } from 'promptwheel';
 
-# run a command, then validate BOTH its --json stdout (Section 2)
-# AND that its exit code matches the verdict (Section 1)
-promptwheel conformance --cmd "your-tool --json"
+const { ok, errors } = conformsToContract(JSON.parse(reportJson));   // Section 2
+const exitMatches = exitCode === verdictExitCode(report.verdict);    // Section 1
 ```
 
-Exit `0` if it conforms, `1` otherwise, listing every problem. This is how a third-party
-implementation earns the right to say "Verified-Outcome Contract compatible."
+`ok` is `true` when the report conforms; otherwise `errors` lists every problem. This is how a
+third-party implementation earns the right to say "Verified-Outcome Contract compatible."
 
 ---
 
