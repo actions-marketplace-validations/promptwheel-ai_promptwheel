@@ -12,6 +12,11 @@ import { createHash } from 'node:crypto';
 import { realpathSync, chmodSync } from 'node:fs';
 
 const ENGINE = join(dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'promptwheel.mjs');
+// every temp repo this file makes, and every clean copy the engine makes for them, goes under one folder that is
+// removed at exit: a run used to leave about 19 folders in the system temp folder
+const TMP_ROOT = mkdtempSync(join(tmpdir(), 'pw-suite-'));
+process.env.TMPDIR = TMP_ROOT;
+process.on('exit', () => rmSync(TMP_ROOT, { recursive: true, force: true }));
 
 // ---------------------------------------------------------------- unit: extract
 test('extract: number = last number in output', () => assert.equal(extract('errors 3, then 7\n', 0), 7));
@@ -65,6 +70,18 @@ test('renderMarkdown: includes verdict, metric, delta', () => {
   const md = renderMarkdown({ base: 'a', head: 'b', mode: 'refs', repeat: 1, verdict: 'pass',
     metrics: [{ name: 'todos', guard: true, before: 4, after: 2, delta: -2, status: 'improved', confidence: 'high' }] });
   assert.match(md, /PASS/); assert.match(md, /todos/); assert.match(md, /-2/);
+});
+
+test('renderMarkdown: with more than one thing to accept, the comment to copy names each, and a reason that named too few says what was not let through', () => {
+  const base = { base: 'a', head: 'b', mode: 'refs', repeat: 1, verdict: 'fail',
+    metrics: [{ name: 'dependency_entries', guard: true, before: 1, after: 2, delta: 1, status: 'regressed', confidence: 'high', ok: false, allowable: true }],
+    explained: [{ metric: 'dependency_entries', noted: false, what: 'a new dependency', allowable: true }] };
+  assert.match(renderMarkdown({ ...base, allowable: ['dependency_entries'] }), /comment `sawbuck-allow: <your reason>` on this PR/, 'one thing: no name needed');
+  const two = renderMarkdown({ ...base, allowable: ['dependency_entries', 'mandate:lock-frozen'], allowed: { reason: 'dependency_entries: needed', cleared: ['dependency_entries'] } });
+  assert.match(two, /comment `sawbuck-allow: dependency_entries, lock-frozen: <your reason>` on this PR/);
+  assert.match(two, /\*\*Allowed:\*\* `dependency_entries`/); assert.match(two, /\*\*Not let through:\*\* `mandate:lock-frozen`/);
+  const none = renderMarkdown({ ...base, allowable: ['dependency_entries', 'mandate:lock-frozen'], allowed: { reason: 'looks fine', cleared: [] } });
+  assert.doesNotMatch(none, /\*\*Allowed:\*\*/); assert.match(none, /\*\*Not let through:\*\* `dependency_entries`, `mandate:lock-frozen`/);
 });
 
 // ------------------------------------------------------------- integration helpers
@@ -372,6 +389,18 @@ test('run --working: SEES newly added untracked files (the dominant agent action
 });
 
 // --------------------------------------------------------------- R4: init + presets
+test('init: a Rust workspace is tested with --workspace (plain cargo test ran 446 of ripgrep\'s 1246 tests, 321 of regex\'s 1410); a single crate keeps cargo test', () => {
+  const tomls = { crate: '[package]\nname = "a"\nversion = "0.1.0"\n', rootpkg: '[package]\nname = "a"\nversion = "0.1.0"\n\n[workspace]\nmembers = ["crates/*"]\n', virtual: '[workspace]\nmembers = ["crates/*"]\n' };
+  const want = { crate: 'cargo test', rootpkg: 'cargo test --workspace', virtual: 'cargo test --workspace' };
+  for (const [k, toml] of Object.entries(tomls)) {
+    const d = mkdtempSync(join(tmpdir(), 'pw-cargo-')); const g = (a) => execFileSync('git', a, { cwd: d });
+    g(['init', '-q']); g(['config', 'user.email', 't@t']); g(['config', 'user.name', 't']);
+    writeFileSync(join(d, 'Cargo.toml'), toml); commitAll(d, 'base');
+    assert.equal(pw(d, ['init']).code, 0, k);
+    assert.equal(JSON.parse(readFileSync(join(d, 'promptwheel.config.json'), 'utf8')).metrics.find((m) => m.name === 'tests_pass').cmd, want[k], k);
+    rmSync(d, { recursive: true, force: true });
+  }
+});
 test('init: writes a starter config for the stack, refuses overwrite without --force', () => {
   const d = mkdtempSync(join(tmpdir(), 'pw-init-'));
   const g = (a) => execFileSync('git', a, { cwd: d });
@@ -574,7 +603,10 @@ test('lock: an agent cannot launder a change by updating the lock; a person can,
   commitAll(d, 'add evil and relock\n\nPromptwheel-Allow: an agent approving itself');
   r = pw(d, ['run', '--base', 'HEAD~1', '--head', 'HEAD', '--no-record', '--json']);
   assert.equal(r.code, 1, 'a trailer clears neither the mandate nor the guards');
+  // a dependency and the lock are two things: a reason that names neither lets neither through
   r = pw(d, ['run', '--base', 'HEAD~1', '--head', 'HEAD', '--no-record', '--json', '--allow', 'reviewed: needed for X']);
+  assert.equal(r.code, 1, r.out); assert.deepEqual(JSON.parse(r.out).allowable, ['dependency_entries', 'mandate:lock-frozen']);
+  r = pw(d, ['run', '--base', 'HEAD~1', '--head', 'HEAD', '--no-record', '--json', '--allow', 'dependency_entries, lock-frozen: reviewed, needed for X']);
   assert.equal(r.code, 0, r.out);
   assert.ok(JSON.parse(r.out).allowed.cleared.includes('mandate:lock-frozen'));
 });
@@ -645,7 +677,7 @@ test('supply-chain gate: a lifecycle script, a dependency or a non-registry lock
   assert.equal(r.code, 1, r.out); assert.equal(r.rep.verdict, 'fail');
   assert.equal(metric(r.rep, 'lifecycle_scripts').ok, false);
   assert.equal(metric(r.rep, 'lifecycle_scripts').allowable, true, 'the report says a declared reason would clear it');
-  assert.match(pw(d, ['run', '--working', '--no-record']).out, /--allow "<reason>"/, 'and the human hint names --allow, not guard:false');
+  assert.match(pw(d, ['run', '--working', '--no-record']).out, /--allow "lifecycle_scripts, unpinned_execution, lock_drift: <reason>"/, 'and the human hint names --allow, not guard:false, with each guard the reason has to name');
   reset();
 
   // a dependency: fails without a reason, passes with one, the reason on the record
@@ -653,8 +685,10 @@ test('supply-chain gate: a lifecycle script, a dependency or a non-registry lock
   r = run();
   assert.equal(r.code, 1, r.out); assert.equal(metric(r.rep, 'dependency_entries').ok, false);
   r = run('--allow', 'needed for the CSV export (papaparse)');
+  assert.equal(r.code, 1, 'two guards, and the reason names neither'); assert.deepEqual(r.rep.allowed.cleared, []);
+  r = run('--allow', 'dependency_entries, lock_drift: needed for the CSV export (papaparse)');
   assert.equal(r.code, 0, r.out); assert.equal(r.rep.verdict, 'pass');
-  assert.deepEqual(r.rep.allowed, { reason: 'needed for the CSV export (papaparse)', cleared: ['dependency_entries', 'lock_drift'] });
+  assert.deepEqual(r.rep.allowed, { reason: 'dependency_entries, lock_drift: needed for the CSV export (papaparse)', cleared: ['dependency_entries', 'lock_drift'] });
   assert.equal(metric(r.rep, 'dependency_entries').ok, true); assert.equal(metric(r.rep, 'dependency_entries').allowed, true);
   assert.equal(metric(r.rep, 'dependency_entries').allowable, undefined, 'cleared, so no longer flagged as awaiting a reason');
   // an agent can write a commit trailer, so a trailer never clears these guards: only the --allow flag does
@@ -662,7 +696,7 @@ test('supply-chain gate: a lifecycle script, a dependency or a non-registry lock
   const rr = pw(d, ['run', '--base', 'HEAD~1', '--head', 'HEAD', '--no-record', '--json']);
   assert.equal(rr.code, 1, rr.out);
   assert.equal(JSON.parse(rr.out).allowed, undefined);
-  const rf = pw(d, ['run', '--base', 'HEAD~1', '--head', 'HEAD', '--no-record', '--json', '--allow', 'a person read it']);
+  const rf = pw(d, ['run', '--base', 'HEAD~1', '--head', 'HEAD', '--no-record', '--json', '--allow', 'dependency_entries and lock_drift: a person read it']);
   assert.equal(rf.code, 0, rf.out);
   g(['reset', '-q', '--hard', 'HEAD~1']);
 
@@ -870,7 +904,31 @@ test('init: a Python stack auto-writes venv linkDirs + PYTHONPATH (so tests_pass
   const cfg = JSON.parse(readFileSync(join(d, 'promptwheel.config.json'), 'utf8'));
   assert.deepEqual(cfg.linkDirs, ['.venv']);
   assert.match(cfg.env.PYTHONPATH, /\{wt\}/);
+  // no install step: the venv is linked into each clean copy, so `pip install -e .` there re-pointed the developer's
+  // own editable install at a folder the check then deleted (6 of 8 real repos could no longer import their package)
+  assert.equal(cfg.setup, undefined, 'init writes no setup for a Python repo');
   rmSync(d, { recursive: true, force: true });
+});
+// The setup `init` wrote for Python until 0.8.7 ran pip in each clean copy against the linked venv. A config that
+// still holds that exact line must not run it. A stand-in pip on PATH says whether it was called.
+test('a config that still holds the old Python setup line does not run pip against the linked venv; another setup still runs', () => {
+  const d = mkdtempSync(join(tmpdir(), 'pw-pysetup-'));
+  const g = (a) => execFileSync('git', a, { cwd: d });
+  g(['init', '-q']); g(['config', 'user.email', 't@t']); g(['config', 'user.name', 't']);
+  const bin = mkdtempSync(join(tmpdir(), 'pw-pybin-')), mark = join(bin, 'called');
+  writeFileSync(join(bin, 'pip'), `#!/bin/sh\necho "$@" >> "${mark}"\n`, { mode: 0o755 });
+  const cfg = (setup) => writeFileSync(join(d, 'promptwheel.config.json'), JSON.stringify({ linkNodeModules: false, linkDirs: ['.venv'], env: { PYTHONPATH: '{wt}/src:{wt}' }, setup, metrics: [{ name: 'tests_pass', cmd: 'true', extract: 'exit', direction: 'pass', guard: true }] }));
+  cfg('pip install -e . --quiet 2>/dev/null || true');
+  writeFileSync(join(d, 'pyproject.toml'), '[project]\nname = "x"\n'); writeFileSync(join(d, '.gitignore'), '.promptwheel/\n'); commitAll(d, 'base');
+  writeFileSync(join(d, 'note.txt'), 'x'); commitAll(d, 'a change');
+  const run = () => { try { return execFileSync('node', [ENGINE, 'run', '--base', 'HEAD~1', '--head', 'HEAD', '--no-record', '--json'], { cwd: d, encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH}` } }); } catch (e) { return `${e.stdout || ''}${e.stderr || ''}`; } };
+  assert.equal(reportOf(run()).verdict, 'pass');
+  assert.equal(existsSync(mark), false, 'the old line is left alone: pip was not run');
+  // a setup the person wrote is theirs and still runs
+  cfg('pip install -e . --no-deps'); commitAll(d, 'my own setup'); writeFileSync(join(d, 'note.txt'), 'y'); commitAll(d, 'another change');
+  run();
+  assert.equal(existsSync(mark), true, 'any other setup command runs as written');
+  rmSync(d, { recursive: true, force: true }); rmSync(bin, { recursive: true, force: true });
 });
 
 test('init: package.json WITHOUT a test script gets the self-describing placeholder', () => {
@@ -1493,6 +1551,65 @@ test('Promptwheel-Allow: the --allow / allow option overrides for a committed or
   const r = check({ repo: d, base: 'HEAD~1', head: 'HEAD', allow: 'the spec changed to 8' });
   assert.equal(r.verdict, 'pass', JSON.stringify(r));
   assert.equal(r.allowed.reason, 'the spec changed to 8');
+  rmSync(d, { recursive: true, force: true });
+});
+// One reason, more than one thing. From an outside report: a reason written about a config change also waved through a
+// gamed test in the same change. Now a reason lets through only what it names when there is more than one thing.
+function twoThings(over = {}) {
+  const d = mkdtempSync(join(tmpdir(), 'pw-two-'));
+  const g = (a) => execFileSync('git', a, { cwd: d });
+  g(['init', '-q']); g(['config', 'user.email', 't@t']); g(['config', 'user.name', 't']);
+  writeFileSync(join(d, '.gitignore'), '.promptwheel/\n');
+  writeFileSync(join(d, 'promptwheel.config.json'), JSON.stringify({ linkNodeModules: false, ...over,
+    metrics: [{ name: 'tests_pass', cmd: 'node --test calc.test.mjs 2>&1', extract: 'exit', direction: 'pass', guard: true }],
+    mandates: [{ name: 'notes-frozen', paths: ['NOTES.md'], allowable: 'flag', reason: 'a person changes the notes' }] }));
+  writeFileSync(join(d, 'calc.mjs'), 'export const sub = (a, b) => a + b;\n');   // BUG
+  writeFileSync(join(d, 'calc.test.mjs'), CALC(2)); writeFileSync(join(d, 'NOTES.md'), 'as it was\n'); commitAll(d, 'base: red');
+  writeFileSync(join(d, 'calc.test.mjs'), CALC(8)); writeFileSync(join(d, 'NOTES.md'), 'changed\n');   // a gamed test and a protected path, one change
+  return d;
+}
+test('--allow: one reason does not let two things through unless it names each; naming one lets that one through', () => {
+  const d = twoThings(); commitAll(d, 'edit the test and the notes');
+  const run = (reason) => { const r = pw(d, ['run', '--base', 'HEAD~1', '--head', 'HEAD', '--no-record', '--json', ...(reason ? ['--allow', reason] : [])]); return { code: r.code, rep: reportOf(r.out) }; };
+  const both = ['tests_pass', 'mandate:notes-frozen'];
+  let r = run();
+  assert.notEqual(r.code, 0); assert.deepEqual(r.rep.allowable, both, 'the report names what a reason could let through');
+  assert.equal(r.rep.allowed, undefined);
+  // the report's own case: a reason about the notes, and the gamed test rides along
+  r = run('the notes were out of date');
+  assert.notEqual(r.code, 0, 'a reason that names neither lets neither through');
+  assert.deepEqual(r.rep.allowed, { reason: 'the notes were out of date', cleared: [] }); assert.deepEqual(r.rep.allowable, both);
+  assert.equal(r.rep.metrics[0].gamed, true); assert.ok(r.rep.mandates.some((m) => m.name === 'notes-frozen'));
+  assert.equal(conformsToContract(r.rep).ok, true, conformsToContract(r.rep).errors.join('; '));
+  const text = pw(d, ['run', '--base', 'HEAD~1', '--head', 'HEAD', '--no-record', '--allow', 'the notes were out of date']).out;
+  assert.match(text, /--allow "tests_pass, notes-frozen: <reason>"/, 'the line to copy names each one');
+  assert.doesNotMatch(text, /✓ allowed/);
+  // naming one lets that one through, and the other still stands
+  r = run('notes-frozen: the notes were out of date');
+  assert.equal(r.rep.verdict, 'gamed'); assert.deepEqual(r.rep.allowed.cleared, ['mandate:notes-frozen']); assert.equal(r.rep.mandates, undefined);
+  r = run('tests_pass: the spec changed to 8');
+  assert.equal(r.rep.verdict, 'fail'); assert.deepEqual(r.rep.allowed.cleared, ['tests_pass']); assert.equal(r.rep.metrics[0].allowed, true);
+  assert.ok(r.rep.mandates.some((m) => m.name === 'notes-frozen'));
+  // a name is a whole word: tests_passing is not tests_pass
+  r = run('tests_passing again, notes-frozen-ish');
+  assert.deepEqual(r.rep.allowed.cleared, []);
+  // naming each lets each through, in any case, with or without the mandate: prefix
+  for (const reason of ['tests_pass, notes-frozen: the spec changed and the notes follow', 'TESTS_PASS and mandate:notes-frozen, reviewed']) {
+    r = run(reason);
+    assert.equal(r.code, 0, reason); assert.equal(r.rep.verdict, 'pass'); assert.deepEqual(r.rep.allowed.cleared, both);
+    assert.equal(conformsToContract(r.rep).ok, true, conformsToContract(r.rep).errors.join('; '));
+  }
+  rmSync(d, { recursive: true, force: true });
+});
+test('--allow: what a reason cannot clear does not count toward more than one thing (a trailer and a flag-only rule)', () => {
+  const d = twoThings(); commitAll(d, 'edit the test and the notes\n\nPromptwheel-Allow: the spec changed to 8');
+  const r = reportOf(pw(d, ['run', '--base', 'HEAD~1', '--head', 'HEAD', '--no-record', '--json']).out);
+  assert.deepEqual(r.allowed, { reason: 'the spec changed to 8', cleared: ['tests_pass'] }, 'the trailer can clear only the test, so it is one thing and needs no name');
+  assert.equal(r.verdict, 'fail', 'the flag-only rule still stands'); assert.deepEqual(r.allowable, ['tests_pass', 'mandate:notes-frozen']);
+  // a trailer that names the flag-only rule still cannot clear it: an agent can write a trailer
+  execFileSync('git', ['commit', '-q', '--amend', '-m', 'edit the test and the notes\n\nPromptwheel-Allow: tests_pass, notes-frozen: approving myself'], { cwd: d });
+  const r2 = reportOf(pw(d, ['run', '--base', 'HEAD~1', '--head', 'HEAD', '--no-record', '--json']).out);
+  assert.deepEqual(r2.allowed.cleared, ['tests_pass']); assert.equal(r2.verdict, 'fail'); assert.ok(r2.mandates.some((m) => m.name === 'notes-frozen'));
   rmSync(d, { recursive: true, force: true });
 });
 test('Sawbuck-Allow (alias): covers an intentional test DELETE (not just an edit)', () => {
@@ -2147,6 +2264,33 @@ test('setup: a base config that extends a file outside the repository is not com
   rmSync(root, { recursive: true, force: true });
 });
 
+test('supply-chain: the dependency-update reason names pins_changed, so a version bump passes and a bump that also adds an install script does not', () => {
+  const d = mkdtempSync(join(tmpdir(), 'pw-bump-'));
+  const g = (a) => execFileSync('git', a, { cwd: d });
+  g(['init', '-q']); g(['config', 'user.email', 't@t']); g(['config', 'user.name', 't']);
+  const pkg = { name: 'demo', scripts: { test: 'node -e 0' }, dependencies: { 'left-pad': '^1' } };
+  const lock = (v) => ({ lockfileVersion: 3, packages: { '': { name: 'demo' }, 'node_modules/left-pad': { version: v, resolved: `https://registry.npmjs.org/left-pad/-/left-pad-${v}.tgz`, integrity: `sha512-${v}` } } });
+  const write = (p, v) => { writeFileSync(join(d, 'package.json'), JSON.stringify(p, null, 2) + '\n'); writeFileSync(join(d, 'package-lock.json'), JSON.stringify(lock(v), null, 2) + '\n'); };
+  write(pkg, '1.3.0'); commitAll(d, 'base');
+  assert.equal(pw(d, ['init', '--preset', 'supply-chain', '--no-agent-block']).code, 0); commitAll(d, 'the contract');
+  const REASON = 'pins_changed: dependabot update, reviewed in this PR';   // the line in packs/supply-chain/README.md
+  assert.ok(readFileSync(join(dirname(ENGINE), '..', 'packs', 'supply-chain', 'README.md'), 'utf8').includes(`'${REASON}'`), 'the README still gives this reason');
+  const run = (...extra) => { const r = pw(d, ['run', '--base', 'HEAD~1', '--head', 'HEAD', '--no-record', '--json', ...extra]); return { code: r.code, rep: reportOf(r.out) }; };
+  // a plain version bump moves the fingerprint and nothing else
+  write(pkg, '1.3.1'); commitAll(d, 'bump left-pad');
+  let r = run();
+  assert.equal(r.code, 1); assert.deepEqual(r.rep.allowable, ['pins_changed'], 'a version bump is one thing');
+  r = run('--allow', REASON);
+  assert.equal(r.code, 0, JSON.stringify(r.rep.allowed)); assert.deepEqual(r.rep.allowed.cleared, ['pins_changed']);
+  // the same bump with an install script riding along: the reason covers the bump only
+  write({ ...pkg, scripts: { ...pkg.scripts, postinstall: 'node setup.js' } }, '1.3.2'); commitAll(d, 'bump left-pad again');
+  r = run('--allow', REASON);
+  assert.equal(r.code, 1, 'the install script is not waved through'); assert.deepEqual(r.rep.allowed.cleared, ['pins_changed']);
+  assert.equal(r.rep.metrics.find((m) => m.name === 'lifecycle_scripts').ok, false);
+  assert.ok(r.rep.allowable.includes('lifecycle_scripts'));
+  rmSync(d, { recursive: true, force: true });
+});
+
 test('supply-chain: a person can accept a hooks change with --allow; a trailer cannot, and a workflow stays frozen either way', () => {
   const d = mkdtempSync(join(tmpdir(), 'pw-hooks-'));
   execFileSync('git', ['init', '-q'], { cwd: d });
@@ -2361,6 +2505,40 @@ test('measure env: a regression in a sibling package is seen, not hidden by read
   assert.equal(rep.verdict, 'fail'); assert.equal(code, 1);
   rmSync(d, { recursive: true, force: true });
 });
+// found by replaying real commits (proof-bench/replay): micromark's build runs micromark-build, a workspace package of
+// its own, through node_modules/.bin. That folder was one link to the working tree's, so the tool ran from the working
+// tree at both refs, and in a fresh clone (nothing built there yet) no commit could be measured.
+test('measure env: a workspace package\'s own executable runs from the ref being measured, not from the working tree', () => {
+  const { d, put } = monoRepo();
+  put('packages/tool/package.json', '{"name":"tool","version":"1.0.0","bin":{"tool":"cli.js"}}');
+  put('packages/tool/cli.js', '#!/usr/bin/env node\nconsole.log(1)\n'); chmodSync(join(d, 'packages/tool/cli.js'), 0o755);
+  symlinkSync('../packages/tool', join(d, 'node_modules/tool'));
+  mkdirSync(join(d, 'node_modules/.bin'), { recursive: true }); symlinkSync('../tool/cli.js', join(d, 'node_modules/.bin/tool'));
+  // an outside tool beside it keeps working
+  put('node_modules/outside/cli.js', '#!/usr/bin/env node\nconsole.log(7)\n'); chmodSync(join(d, 'node_modules/outside/cli.js'), 0o755); symlinkSync('../outside/cli.js', join(d, 'node_modules/.bin/outside'));
+  put('promptwheel.config.json', JSON.stringify({ metrics: [{ name: 'tool_says', cmd: 'node_modules/.bin/tool', extract: 'number', direction: 'up' }, { name: 'outside_says', cmd: 'node_modules/.bin/outside', extract: 'number', direction: 'up' }] }));
+  commitAll(d, 'a tool that says 1');
+  put('packages/tool/cli.js', '#!/usr/bin/env node\nconsole.log(2)\n'); commitAll(d, 'the tool says 2');
+  const { rep } = runJson(d);
+  const m = rep.metrics.find((x) => x.name === 'tool_says');
+  assert.equal(m.before, 1, 'the base ref runs the base ref\'s tool, not the working tree\'s'); assert.equal(m.after, 2);
+  assert.equal(rep.metrics.find((x) => x.name === 'outside_says').after, 7, 'a tool from outside the repo still runs');
+  rmSync(d, { recursive: true, force: true });
+});
+// A LIMIT, pinned so it is known: an outside dependency lives in the real node_modules, and Node resolves what it
+// imports from its real folder. So a workspace package it imports is the working tree's copy, at both refs. micromark's
+// tests reach micromark itself this way, through mdast-util-from-markdown.
+test('LIMIT measure env: a dependency from outside the repo that imports a workspace package reads the working tree\'s copy, not the ref\'s', () => {
+  const { d, put } = monoRepo();
+  put('node_modules/outside/package.json', '{"name":"outside","version":"1.0.0","main":"index.js"}');
+  put('node_modules/outside/index.js', "module.exports=(a,b)=>require('@x/util').add(a,b)\n");   // an outside package that imports the sibling
+  put('promptwheel.config.json', JSON.stringify({ metrics: [{ name: 'through_outside', cmd: "node -e \"console.log(require('outside')(2,3))\"", extract: 'number', direction: 'up' }] }));
+  put('packages/util/index.js', 'exports.add=(a,b)=>a+b\n'); commitAll(d, 'add gives 5');
+  put('packages/util/index.js', 'exports.add=(a,b)=>a*b\n'); commitAll(d, 'add gives 6');
+  const m = runJson(d).rep.metrics.find((x) => x.name === 'through_outside');
+  assert.equal(m.before, 6, 'the base ref should read 5; through the outside package it reads the working tree (6)'); assert.equal(m.after, 6);
+  rmSync(d, { recursive: true, force: true });
+});
 test('measure env: a single-package repo keeps one link for node_modules; a workspaces repo gets its own folder, so a test cannot write into the real one', () => {
   const probe = [{ name: 'nm_is_link', cmd: '[ -L node_modules ] && echo 1 || echo 0', extract: 'number', direction: 'up' },
     { name: 'writes', cmd: 'touch node_modules/.made-by-a-test 2>/dev/null; echo 1', extract: 'number', direction: 'up' }];
@@ -2448,6 +2626,22 @@ test('run: a test metric that fails at both refs says whether a dependency is mi
   assert.equal(missing.inert, true); assert.equal(missing.cause, 'missing-dependency'); assert.match(missing.detail, /a-package-nobody-installed/);
   const red = mk("require('node:test').test('t', () => require('node:assert').equal(1, 2));\n");
   assert.equal(red.inert, true); assert.equal(red.cause, 'failing');
+});
+// A script that dies on a failed ES module import prints the source line `throw new ERR_MODULE_NOT_FOUND(` first and
+// the line that names the file after it. The hint is the line that names it: on micromark it read
+// "ERR_MODULE_NOT_FOUND(" and nothing else.
+test('run: the missing-dependency hint names the file, not the bare error code above it', () => {
+  const d = mkdtempSync(join(tmpdir(), 'pw-esm-'));
+  const g = (a) => execFileSync('git', a, { cwd: d });
+  g(['init', '-q']); g(['config', 'user.email', 't@t']); g(['config', 'user.name', 't']);
+  writeFileSync(join(d, '.gitignore'), '.promptwheel/\n');
+  writeFileSync(join(d, 'package.json'), JSON.stringify({ name: 'x', version: '1.0.0', type: 'module', scripts: { test: 'node run.mjs' } }));
+  writeFileSync(join(d, 'run.mjs'), "import './not-here.mjs';\n"); commitAll(d, 'a');
+  writeFileSync(join(d, 'note.txt'), 'x'); commitAll(d, 'b');
+  const m = runJson(d).rep.metrics.find((x) => x.name === 'tests_pass');
+  assert.equal(m.cause, 'missing-dependency');
+  assert.match(m.detail, /^Cannot find module .*not-here\.mjs.* imported from .*run\.mjs/, m.detail);
+  rmSync(d, { recursive: true, force: true });
 });
 
 // ---- found by running real repos (proof-bench/field): tap prints every assertion when its output is a pipe, more than
