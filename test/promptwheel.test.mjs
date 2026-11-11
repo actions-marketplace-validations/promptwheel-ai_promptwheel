@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { extract, evaluate, median, spread, renderMarkdown, isNonSource, evaluatorMatcher, gain, judgeGaming, verdictFingerprint,
   allowFromComments, check, verdictExitCode, conformsToContract, VERDICTS, METRIC_STATUSES, DIRECTIONS, CONTRACT_VERSION, deriveVerdict } from '../bin/promptwheel.mjs';
 import { createHash } from 'node:crypto';
-import { realpathSync } from 'node:fs';
+import { realpathSync, chmodSync } from 'node:fs';
 
 const ENGINE = join(dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'promptwheel.mjs');
 
@@ -891,6 +891,23 @@ const pwTmp = (tmp, d, args) => {
   try { return { out: execFileSync('node', [ENGINE, ...args], { cwd: d, encoding: 'utf8', env: { ...process.env, TMPDIR: tmp } }), code: 0 }; }
   catch (e) { return { out: `${e.stdout || ''}${e.stderr || ''}`, code: e.status }; }
 };
+test('a read-only system temp folder (a sandboxed agent, a locked-down runner) does not stop the gate: it measures inside .git', () => {
+  const ro = mkdtempSync(join(tmpdir(), 'pw-ro-')); chmodSync(ro, 0o555);
+  const d = tmpRepo([TODOS]); writeFileSync(join(d, 'a.js'), '// TODO one\n'); commitAll(d, 'base'); writeFileSync(join(d, 'a.js'), '// done\n'); commitAll(d, 'fix');
+  const before = execFileSync('git', ['status', '--porcelain'], { cwd: d, encoding: 'utf8' }).trim();
+  try {
+    const r = pwTmp(ro, d, ['run', '--base', 'HEAD~1', '--head', 'HEAD', '--no-record']);
+    assert.ok(!/EROFS|EACCES|mkdtemp|cannot write/.test(r.out), r.out); assert.match(r.out, /todos/, 'it measured');
+    assert.ok(existsSync(join(d, '.git', 'promptwheel-tmp')), 'the clean copies went under .git');
+    assert.equal(execFileSync('git', ['status', '--porcelain'], { cwd: d, encoding: 'utf8' }).trim(), before, 'git status shows nothing new');
+  } finally { chmodSync(ro, 0o755); rmSync(ro, { recursive: true, force: true }); rmSync(d, { recursive: true, force: true }); }
+});
+test('a sandboxed shell where both the temp folder and .git are read-only gets one plain sentence, not a stack', () => {
+  const ro = mkdtempSync(join(tmpdir(), 'pw-ro2-')); chmodSync(ro, 0o555);
+  const d = tmpRepo([TODOS]); writeFileSync(join(d, 'a.js'), '// TODO one\n'); commitAll(d, 'base'); writeFileSync(join(d, 'a.js'), '// done\n'); commitAll(d, 'fix'); const gd = join(d, '.git'); const pt = join(gd, 'promptwheel-tmp'); mkdirSync(pt); chmodSync(pt, 0o555);
+  try { const r = pwTmp(ro, d, ['run', '--base', 'HEAD~1', '--head', 'HEAD', '--no-record']); assert.match(r.out, /this shell cannot write a temp folder or \.git/); assert.ok(!/at mkdtempSync/.test(r.out), 'no stack'); }
+  finally { chmodSync(ro, 0o755); chmodSync(pt, 0o755); rmSync(ro, { recursive: true, force: true }); rmSync(d, { recursive: true, force: true }); }
+});
 test('self-heal: a stale /tmp worktree from a crashed run is cleaned on the next run; an untagged dir is never removed', () => {
   const tmp = mkdtempSync(join(tmpdir(), 'pw-heal-'));
   const d = tmpRepo([TODOS]);
@@ -2435,3 +2452,10 @@ test('run: --allow does not turn an inconclusive result into a pass: a waiver ov
   assert.doesNotMatch(r.out, /VERDICT: PASS/);
   rmSync(d, { recursive: true, force: true });
 });
+
+test('a test that prints an HTTP "Not found" is not read as a missing dependency; a shell "command not found" still is', async () => {
+  const { MISSING_DEP } = await import('../bin/promptwheel.mjs');
+  for (const t of ['#   Error: Not found', 'GET /users/9 404 Not found', 'expected "Not found" to equal "OK"']) assert.ok(!MISSING_DEP.test(t), t);
+  for (const t of ['sh: 1: jest: not found', '/bin/sh: 1: vitest: not found', 'bash: tsc: command not found', "Error: Cannot find module 'left-pad'"]) assert.ok(MISSING_DEP.test(t), t);
+});
+
