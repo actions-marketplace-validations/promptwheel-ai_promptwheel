@@ -23,6 +23,29 @@ import { fileURLToPath } from 'node:url';
 // helpers
 // ---------------------------------------------------------------------------
 const git = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
+// File names from git, NUL-separated (the caller's command must take -z). Read as lines, a name that holds a byte
+// above 127, a double quote, a backslash or a tab comes back inside quotes with the bytes escaped
+// ("src/a\303\261adir.js", git's core.quotePath), and that string is no file: it matches no protected path and no
+// pathspec, so an honest fix in such a file read "gamed" and a new workflow with such a name was no protected path.
+const gitNames = (args, cwd) => execFileSync('git', [...args, '-z'], { cwd, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 }).split('\0').filter(Boolean);
+// The engine's own throwaway checkouts run none of the person's git hooks. `git worktree add` fires post-checkout,
+// from the repo's hooks folder or the person's global one (core.hooksPath): a hook that rebuilds tags or installs
+// packages ran in every throwaway copy, and one that exits 1 on a detached HEAD made the add fail after the checkout
+// was made, so no check could run and each try left a worktree behind. CI has no such hooks either; what a checkout
+// needs before it can be measured is the contract's "setup".
+function addWorktree(repo, wt, ref) {
+  try { git(['-c', 'core.hooksPath=/dev/null', 'worktree', 'add', '--quiet', '--detach', wt, ref], repo); }
+  catch (e) {
+    try { git(['worktree', 'remove', '--force', wt], repo); } catch { /* it was never registered */ }
+    try { rmSync(wt, { recursive: true, force: true }); } catch { /* best effort */ }
+    throw e;
+  }
+}
+// The source-only patch is read by `git apply`, so it has to read the same on every machine. A plain `git diff` obeys
+// the person's own settings: diff.noprefix (no a/ b/), diff.external or GIT_EXTERNAL_DIFF (a side-by-side tool, or one
+// that is not installed), color.ui=always, a text converter, diff.context=0. Each made a patch that did not apply.
+// The win then read "inconclusive", and an inconclusive turn is not sent back.
+const PATCH_FLAGS = ['--no-ext-diff', '--no-textconv', '--no-color', '--no-renames', '--full-index', '--src-prefix=a/', '--dst-prefix=b/', '-U3', '--submodule=short'];
 const median = (xs) => {
   const a = xs.filter((x) => x != null).slice().sort((p, q) => p - q);
   if (!a.length) return null;
@@ -102,13 +125,13 @@ function resolveConfig(p, repo, seen) {
       const base = resolveConfig(bp, repo, seen);
       for (const m of base.metrics) byName.set(m.name, m);
       for (const md of (base.mandates || [])) if (md && md.name) mandatesByName.set(md.name, md);
-      for (const k of ['repeat', 'linkNodeModules', 'linkDirs', 'env', 'setup', 'gamingThreshold', 'evaluatorPaths', 'allowTrailer']) if (base[k] !== undefined) scalars[k] = base[k];
+      for (const k of ['repeat', 'linkNodeModules', 'linkDirs', 'env', 'setup', 'gamingThreshold', 'evaluatorPaths', 'allowTrailer', 'allowFromAuthor']) if (base[k] !== undefined) scalars[k] = base[k];
     }
     for (const m of (cfg.metrics || [])) {
       byName.set(m.name, m);
     }
     for (const md of (cfg.mandates || [])) if (md && md.name) mandatesByName.set(md.name, md);
-    for (const k of ['repeat', 'linkNodeModules', 'linkDirs', 'env', 'setup', 'gamingThreshold', 'evaluatorPaths', 'allowTrailer']) if (cfg[k] !== undefined) scalars[k] = cfg[k];
+    for (const k of ['repeat', 'linkNodeModules', 'linkDirs', 'env', 'setup', 'gamingThreshold', 'evaluatorPaths', 'allowTrailer', 'allowFromAuthor']) if (cfg[k] !== undefined) scalars[k] = cfg[k];
     return { ...scalars, metrics: [...byName.values()], mandates: [...mandatesByName.values()] };
   } finally {
     seen.delete(abs); // only ACTIVE ancestors are a cycle, a diamond (a base reached two ways) is fine
@@ -314,7 +337,7 @@ const setupFails = new WeakMap();   // a measureAt result -> how its setup faile
 // measure every metric `repeat` times at a ref, in a throwaway worktree (never touches your tree)
 function measureAt(repo, ref, cfg, repeat) {
   const wt = mkdtempSync(join(tmpBase(repo), tmpPrefix(repo, 'promptwheel')));
-  git(['worktree', 'add', '--quiet', '--detach', wt, ref], repo);
+  addWorktree(repo, wt, ref);
   try {
     const env = bridgeEnv(repo, wt, cfg);
     const setupFailed = runSetup(wt, cfg, env);
@@ -475,7 +498,7 @@ function checkMandates(repo, base, head, cfg, baseMandates) {
   const mandates = [...headList.filter((m) => m && baseNames.has(m.name)), ...kept];
   if (!mandates.length) return [];
   let changed = [];
-  try { changed = git(['diff', '--name-only', '--no-renames', base, head], repo).split('\n').filter(Boolean); } catch { return []; }   // --no-renames: a move out of a protected path also touches it
+  try { changed = gitNames(['diff', '--name-only', '--no-renames', base, head], repo); } catch { return []; }   // --no-renames: a move out of a protected path also touches it
   const out = [];
   for (const m of mandates) {
     const pats = (Array.isArray(m.paths) ? m.paths : []).filter((s) => typeof s === 'string' && s.trim());
@@ -542,7 +565,7 @@ function runnerScripts(repo, base, cfg) {
   return out;
 }
 function changedSourcePaths(repo, base, head, isEval = () => false, cfg = null) {
-  const all = git(['diff', '--name-only', '--no-renames', base, head], repo).split('\n').filter(Boolean);
+  const all = gitNames(['diff', '--name-only', '--no-renames', base, head], repo);
   const runners = cfg ? runnerScripts(repo, base, cfg) : new Set();
   const nonSrc = (p) => isNonSource(p) || isEval(p) || runners.has(p) || pyTestModule(repo, base, head, p);
   return { source: all.filter((p) => !nonSrc(p)), nonSource: all.filter(nonSrc) };
@@ -588,13 +611,13 @@ function measureSourceOnlyAll(repo, base, head, defs, cfg, repeat, guardsFrom = 
   const { source } = changedSourcePaths(repo, base, head, evaluatorMatcher(cfg), guardsFrom);
   if (!source.length) { for (const m of defs) out[m.name] = { samples: [], hadSourceChange: false }; return out; } // a "win" with zero source edits = goalposts moved
   const wt = mkdtempSync(join(tmpBase(repo), tmpPrefix(repo, 'promptwheel-src')));
-  git(['worktree', 'add', '--quiet', '--detach', wt, base], repo);
+  addWorktree(repo, wt, base);
   try {
     const env = bridgeEnv(repo, wt, cfg);
     // --binary so a binary source file (an image, a model blob under src/) travels in the patch; without
     // it git prints "Binary files differ", the apply fails, and a win the source never earned would
     // read as unprovable. Untrimmed: a binary hunk ends in a blank line the apply needs.
-    const patch = execFileSync('git', ['diff', '--binary', base, head, '--', ...source], { cwd: repo, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 });
+    const patch = execFileSync('git', ['diff', '--binary', ...PATCH_FLAGS, base, head, '--', ...source], { cwd: repo, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 });
     if (patch.trim()) {
       // stdio stderr 'ignore': git apply --3way prints "Applied patch ... cleanly" to stderr; that
       // is noise on an otherwise-quiet run (and corrupts --json for callers that fold in stderr).
@@ -731,7 +754,7 @@ function warnEditableInstall(repo) {
 // guarded metric in the very diff it "passes". We resolve the gate as of BASE too and, if a
 // guard was dropped, re-measure it under its BASE definition; the pass only reads GAMED when
 // that guard WOULD HAVE FAILED at head (a real regression hidden by moving the goalposts).
-const GATE_SCALARS = ['gamingThreshold', 'evaluatorPaths', 'allowTrailer', 'setup', 'env', 'linkDirs', 'linkNodeModules'];
+const GATE_SCALARS = ['gamingThreshold', 'evaluatorPaths', 'allowTrailer', 'allowFromAuthor', 'setup', 'env', 'linkDirs', 'linkNodeModules'];
 // what runs or shapes every measurement besides the metric's own command. A setup can rewrite a test and an
 // env var can skip one, so these are part of the gate: fingerprinted, and held at their base values for the
 // change that edits them (see detectGamingPass).
@@ -806,6 +829,9 @@ function gateFingerprint(metricsList, scalars) {
     evaluatorPaths: Array.isArray(scalars.evaluatorPaths) ? [...scalars.evaluatorPaths].sort() : [],
     measuredWith: measuredWith(scalars),
     mandates: Array.isArray(scalars.mandates) ? scalars.mandates.map((m) => ({ name: String(m.name || ''), paths: [...(Array.isArray(m.paths) ? m.paths : [])].sort() })).sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)) : [],
+    // who may let a pull request through is part of the gate. Only `true` is written, so a contract without the
+    // key keeps the fingerprint it had before 0.8.10.
+    ...(scalars.allowFromAuthor === true ? { allowFromAuthor: true } : {}),
   };
   return createHash('sha256').update(JSON.stringify(norm)).digest('hex').slice(0, 16);
 }
@@ -831,7 +857,7 @@ function blobHashAt(repo, ref, path) {
 function changedEvaluatorPaths(repo, base, head, cfg) {
   const isEval = evaluatorMatcher(cfg);
   let changed = [];
-  try { changed = git(['diff', '--name-only', '--no-renames', base, head], repo).split('\n').filter(Boolean).filter(isEval); }
+  try { changed = gitNames(['diff', '--name-only', '--no-renames', base, head], repo).filter(isEval); }
   catch { return []; }
   return changed.map((p) => ({ path: p, base: blobHashAt(repo, base, p), head: blobHashAt(repo, head, p) }))
     .filter((e) => e.base !== e.head);
@@ -877,7 +903,7 @@ function gateWeakenings(baseGate, headMetrics) {
 const reasonNames = (reason, label) => new RegExp(`(^|[^A-Za-z0-9_-])${label.replace(/^mandate:/, '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}($|[^A-Za-z0-9_-])`, 'i').test(reason);
 function readAllowTrailer(repo, ref) {
   let msg = '';
-  try { msg = execFileSync('git', ['log', '-1', '--format=%B', ref], { cwd: repo, encoding: 'utf8' }); } catch { return null; }
+  try { msg = execFileSync('git', ['log', '-1', '--no-show-signature', '--format=%B', ref], { cwd: repo, encoding: 'utf8' }); } catch { return null; }
   const m = msg.match(/^[ \t]*(?:Promptwheel-Allow|Sawbuck-Allow)[ \t]*:[ \t]*(\S.*?)[ \t]*$/im);
   return m && m[1].trim() ? { reason: m[1].trim().slice(0, 300) } : null;
 }
@@ -1126,9 +1152,12 @@ function gate(repo, opts) {
   for (const m of guards) if (!m.allowed) m.allowable = true;   // failed, and a declared reason would clear it: say so in the report
   const mandated = mandateViolations.length > 0;
   const verdict = deriveVerdict(metrics, gateInfo, mandated);
-  const explained = explainMetrics(repo, metrics);
+  // what was measured in words, and one thing no diff shows: a variable in this environment that can change which
+  // tests run (environmentNote). A variable the contract's own `env` sets is declared there and not noted.
+  const envNote = environmentNote(process.env, cfg.env);
+  const explained = [...(explainMetrics(repo, metrics) || []), ...(envNote ? [envNote] : [])];
   const report = {
-    ...(explained ? { explained } : {}),
+    ...(explained.length ? { explained } : {}),
     base: short(repo, base), head: short(repo, head), repeat, mode: opts.working ? 'working' : 'refs',
     verdict, metrics,
     ...(mandateViolations.length ? { mandates: mandateViolations } : {}),
@@ -1194,7 +1223,9 @@ const PRESETS = {
     evaluatorPaths: ['promptwheel.config.json', 'sawbuck.config.json'],
     mandates: [
       { name: 'contract-frozen', paths: ['promptwheel.config.json', 'sawbuck.config.json'], allowable: 'flag', reason: 'the contract changes with a reason from a person (--allow), never as a side effect of a change' },
-      { name: 'workflows-frozen', paths: ['.github/workflows/**'], reason: 'workflows run with the repository secrets; change them in a separate, reviewed change' },
+      // a workflow change is ordinary upkeep (64 of the 65 protected-path send-backs on 340 real commits, 20 of them only an
+      // action's version): a rule with no way through but deleting it teaches people to delete it. So it takes a reason.
+      { name: 'workflows-frozen', paths: ['.github/workflows/**'], allowable: 'flag', reason: 'workflows run with the repository secrets; they change with a reason from a person (--allow), never as a side effect of a change' },
       { name: 'registry-config-frozen', paths: ['.npmrc', '.yarnrc', '.yarnrc.yml'], reason: 'registry and token configuration decides where packages come from and where credentials go' },
       { name: 'build-images-frozen', paths: ['Dockerfile*', 'docker-compose*'], reason: 'what runs at build and deploy time is not an agent decision' },
       { name: 'publish-scripts-frozen', paths: ['scripts/release*', 'scripts/publish*'], reason: 'the publish path is how a compromise spreads' },
@@ -1376,6 +1407,7 @@ function printHuman(r) {
     else if (m.inert) console.log(`      ⚠ "${m.name}" ${m.ran ? `ran and failed at the ${m.ran} ref and did not run at the other` : 'never ran (same value at both refs)'}: its command needs a build/deps first, or is not your real test command. Fix: promptwheel init, or set setup/linkDirs in promptwheel.config.json`);
     if (m.gamed === true) console.log(`      🚩 GAMED, ${m.gamingReason}`);
   }
+  for (const x of r.explained || []) if (x.metric === 'environment') console.log(`  ℹ note: ${x.what}: ${x.items.join(', ')}`);
   if (r.setup) { const at = Object.keys(r.setup), f = r.setup[at[0]]; console.log(`  ⚠ setup failed (exit ${f.exit}) at the ${at.join(' and ')} ref${at.length > 1 ? 's' : ''}${f.lastLine ? ': ' + f.lastLine : ''}`); }
   if (r.gate && r.gate.weakened) for (const w of r.gate.weakened) console.log(w.change === 'measurement-edited'
     ? `  🚩 GATE WEAKENED, how the guard "${w.name}" is measured (setup, env or linked dirs) was edited in this change, and measured the way it was before it would have ${wouldHave(w.status)} at head (goalpost moved, not earned)`
@@ -1408,6 +1440,20 @@ const PLAIN = {
   pins_changed: 'resolved dependency versions changed', tests_pass: 'tests stopped passing', test_count: 'fewer tests', skipped_tests: 'more skipped tests',
   suppressions: 'more silenced checks', assertions: 'fewer assertions',
 };
+// What the measurement borrows from the machine it runs on and no diff shows: a variable that can change which tests
+// run, or load code into every one of them. Measured 2026-11-11 (proof-bench/outside-git): a PYTEST_ADDOPTS that
+// deselects the red test and a preload in NODE_OPTIONS each read pass while a fresh install was red. Removing them
+// could break a setup that needs them, so the check runs as it is told and says so. A NODE_OPTIONS that loads no file
+// (a memory limit, say) is not one.
+const ENV_NOTED = [
+  ['PYTEST_ADDOPTS', (v) => !!v.trim()],
+  ['PYTEST_PLUGINS', (v) => !!v.trim()],
+  ['NODE_OPTIONS', (v) => /(^|\s)(-r|--require|--import|--loader|--experimental-loader)(\s|=)/.test(v)],
+];
+export function environmentNote(env = process.env, declared = null) {
+  const set = ENV_NOTED.filter(([k, hit]) => typeof env[k] === 'string' && hit(env[k]) && !(declared && Object.prototype.hasOwnProperty.call(declared, k))).map(([k]) => k);
+  return set.length ? { metric: 'environment', noted: true, what: 'the environment this ran in can change which tests run, or load code into them', items: set } : null;
+}
 function explainMetrics(repo, metrics) {
   const hit = metrics.filter((m) => m.noted || (m.guard && !m.ok));
   if (!hit.length) return null;
@@ -1418,16 +1464,26 @@ function explainMetrics(repo, metrics) {
   return hit.map((m) => ({ metric: m.name, noted: !!m.noted, what: PLAIN[m.name] || m.name, ...(m.name === 'lock_drift' && items.length ? { items } : {}), ...(m.allowable ? { allowable: true } : {}) }));
 }
 // A reason a person left on a pull request. The newest `sawbuck-allow: <reason>` comment from someone with write
-// access wins. A bot never counts. An agent signed in as that person can still post one: the record shows it.
-export function allowFromComments(comments) {
+// access wins. A bot never counts. Since 0.8.10 neither does the account that opened the pull request (`author`),
+// in any letter case: a coding agent run from a service account, which GitHub calls a User, opens its pull requests
+// from that account and can post the comment, and the report spells out the words. The opener counts only where
+// the contract on the base branch says so (`allowFromAuthor`, for a repo with one person in it). With no opener
+// named the old rule holds, for a caller that does not know who opened it. An agent signed in as another person
+// can still post one: the record shows who.
+export function allowDecision(comments, opts = {}) {
   const trusted = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
+  const opener = String((opts && opts.author) || '').trim().toLowerCase();
+  let skipped = '';
   for (const c of [...(comments || [])].reverse()) {
     if (!c || !c.user || c.user.type !== 'User' || !trusted.has(c.author_association)) continue;
     const m = String(c.body || '').match(/^\s*sawbuck-allow:[ \t]*(\S.*?)[ \t]*$/m);
-    if (m) return `${m[1].slice(0, 280)} (approved by ${String(c.user.login).slice(0, 39)})`;
+    if (!m) continue;
+    if (opener && !(opts && opts.allowFromAuthor === true) && String(c.user.login || '').toLowerCase() === opener) { skipped = skipped || String(c.user.login).slice(0, 39); continue; }
+    return { reason: `${m[1].slice(0, 280)} (approved by ${String(c.user.login).slice(0, 39)})`, skipped: '' };
   }
-  return '';
+  return { reason: '', skipped };
 }
+export function allowFromComments(comments, opts) { return allowDecision(comments, opts).reason; }
 
 function renderMarkdown(r) {
   const icon = r.verdict === 'pass' ? '✅' : r.verdict === 'gamed' ? '🚩' : r.verdict === 'inconclusive' ? '🟡' : '❌';
@@ -1443,7 +1499,7 @@ function renderMarkdown(r) {
     `\`${r.base} → ${r.head}\` · ${r.mode} mode${r.repeat > 1 ? ` · ×${r.repeat}` : ''}`,
     '',
     ...(r.mandates ? [r.mandates.map((md) => `> ⛔ **Protected path touched:** \`${md.name}\`${md.reason ? ': ' + md.reason : ''} (touched \`${md.files.join('`, `')}\`)${md.removed ? ' (deleted in this same change; it stays in force for the change that removes it)' : md.edited ? ' (edited in this same change; the version before the change stays in force for the change that edits it)' : ''}`).join('\n'), ''] : []),
-    ...(r.explained ? [...r.explained.map((x) => `> ${x.noted ? 'ℹ️ **Note:**' : '✋ **Needs a look:**'} ${x.what}${x.items ? ': `' + x.items.join('`, `') + '`' : ''}`), ...(r.explained.some((x) => !x.noted && x.allowable) ? ['>', `> To accept this, comment \`sawbuck-allow: ${allowNames(r)}<your reason>\` on this PR and re-run the check.${allowNames(r) ? ' A reason lets through only what it names when there is more than one thing.' : ''}`] : []), ''] : []),
+    ...(r.explained ? [...r.explained.map((x) => `> ${x.noted ? 'ℹ️ **Note:**' : '✋ **Needs a look:**'} ${x.what}${x.items ? ': `' + x.items.join('`, `') + '`' : ''}`), ...(r.explained.some((x) => !x.noted && x.allowable) ? ['>', `> To accept this, someone with write access who did not open this PR comments \`sawbuck-allow: ${allowNames(r)}<their reason>\` on it, and the check is run again.${allowNames(r) ? ' A reason lets through only what it names when there is more than one thing.' : ''}`] : []), ''] : []),
     '| metric | before | after | Δ | status | confidence |',
     '|---|--:|--:|--:|---|---|',
     rows,
@@ -1451,7 +1507,7 @@ function renderMarkdown(r) {
     r.verdict === 'gamed' ? '> 🚩 A metric "improved" only because the agent edited tests/config/grader, not the source. The win does not survive a source-only re-run.' : r.verdict === 'fail' ? (r.mandates ? '> ⛔ A protected path changed. This is a hard rule; no metric result clears it.' : '> ❌ A 🛡️ guarded metric regressed beyond the noise band.') : r.verdict === 'inconclusive' ? (r.metrics.some((m) => m.inert) && r.metrics.every((m) => !m.inert || m.ran === 'both') ? '> 🟡 A 🛡️ guarded check is **inert**, it fails before and after this change, so nothing was actually verified. Fix it before trusting a pass.' : '> 🟡 A 🛡️ guarded check is **inert**, it never runs, so nothing was actually verified. Fix its command before trusting a pass.') : '> ✅ No guarded metric regressed.',
     ...(r.gate && r.gate.weakened ? ['', `> 🚩 **Gate weakened:** ${r.gate.weakened.map((w) => `\`${w.name}\` ${w.change === 'guard-removed' ? 'removed' : w.change === 'guard-edited' ? 'edited' : w.change === 'measurement-edited' ? 'measured another way (setup, env or linked dirs)' : 'disabled'} (would have ${wouldHave(w.status)} at head)`).join('; ')}. The pass was bought by changing the gate, not by earning it.`] : []),
     ...(r.allowed && r.allowed.cleared.length ? ['', `> ✓ **Allowed:** \`${r.allowed.cleared.join('`, `')}\` cleared by a declared reason: ${r.allowed.reason}`] : []),
-    ...(r.allowed && (r.allowable || []).some((l) => !r.allowed.cleared.includes(l)) ? ['', `> ✋ **Not let through:** \`${r.allowable.filter((l) => !r.allowed.cleared.includes(l)).join('`, `')}\`. A reason lets through only what it names when there is more than one thing. To accept them all, comment \`sawbuck-allow: ${allowNames(r)}<your reason>\`.`] : []),
+    ...(r.allowed && (r.allowable || []).some((l) => !r.allowed.cleared.includes(l)) ? ['', `> ✋ **Not let through:** \`${r.allowable.filter((l) => !r.allowed.cleared.includes(l)).join('`, `')}\`. A reason lets through only what it names when there is more than one thing. To accept them all, someone with write access who did not open this PR comments \`sawbuck-allow: ${allowNames(r)}<their reason>\`.`] : []),
     ...(r.gate && r.gate.changed ? ['', `> ⚠ **Gate definition changed** in this diff (fingerprint \`${r.gate.fingerprint.base}\` -> \`${r.gate.fingerprint.head}\`): a metric, guard, evaluatorPath, mandate, or the setup, env or linked dirs they are measured with was added, removed or edited. Review the config change with the code.`] : []),
     '',
     '<sub>🛡️ = guard · _prove every change moved a metric_ · [PromptWheel](https://github.com/promptwheel-ai/promptwheel)</sub>',
@@ -1667,12 +1723,21 @@ function checkFlags(cmd, argv) {
 
 // read PR comments on stdin: a JSON array, or one comment per line as `gh api --paginate --jq '.[]'` prints every
 // page. Streamed: readFileSync(0) corrupted the heap on Node 24.22 reading a live paginated gh pipe.
-async function prAllow() {
+// --author <login>: the account that opened the pull request; its own comment does not count, unless the contract at
+// --base <ref> holds "allowFromAuthor": true (read from that commit, so a pull request cannot say so for itself).
+// --note <file>: when the only approval was the opener's, one line saying so, for the comment the check posts.
+async function prAllow(argv = []) {
+  const val = (f) => { const i = argv.indexOf(f); return i > -1 && argv[i + 1] !== undefined && !String(argv[i + 1]).startsWith('--') ? String(argv[i + 1]) : ''; };
+  const author = val('--author'), base = val('--base'), note = val('--note');
   let t = ''; process.stdin.setEncoding('utf8');
   for await (const chunk of process.stdin) t += chunk;
   t = t.trim(); let c = [];
   try { c = [].concat(JSON.parse(t || '[]')); } catch { try { c = t.split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { /* unreadable, no approval */ } }
-  process.stdout.write(allowFromComments(c));
+  let own = false;
+  if (author && base) { try { own = ((gateDefAtRef(process.cwd(), base) || {}).scalars || {}).allowFromAuthor === true; } catch { /* no contract at the base: the opener does not count */ } }
+  const d = allowDecision(c, { author, allowFromAuthor: own });
+  if (note) { try { writeFileSync(note, d.skipped && !d.reason ? `\n> ✋ **Not counted:** a \`sawbuck-allow:\` comment from \`${d.skipped}\`, the account that opened this pull request. Whoever opened a pull request cannot let it through. Someone else with write access can. In a repo with one person in it, set \`"allowFromAuthor": true\` in \`promptwheel.config.json\` on the base branch; a pull request cannot turn that on for itself.\n` : ''); } catch { /* the note is a courtesy */ } }
+  process.stdout.write(d.reason);
 }
 
 // write or refresh the architecture lock from the tree as it stands. A person runs this: the lock file is
@@ -1689,7 +1754,7 @@ function dispatch() {
   const cmd = (rest.includes('--help') || rest.includes('-h')) ? 'help' : first;   // `promptwheel run --help` is a help request, not a gate run
   if (cmd in COMMAND_FLAGS) checkFlags(cmd, rest);
   if (cmd === 'run') run(rest);
-  else if (cmd === 'pr-allow') return prAllow();
+  else if (cmd === 'pr-allow') return prAllow(rest);
   else if (cmd === 'init') init(rest);
   else if (cmd === 'lock') return lock(rest);
   else {
@@ -1706,7 +1771,8 @@ function dispatch() {
       '       catches reward-hacking BY DEFAULT, re-proves each win from SOURCE edits alone (verdict GAMED,',
       '       exit 2, when a metric only moved by editing tests/config/grader). Use --no-detect-gaming for the bare gate.',
       '  promptwheel run --working                    gate uncommitted changes (incl. newly added files)',
-      '  promptwheel pr-allow < comments.json         print the newest `sawbuck-allow: <reason>` from a PR comment by someone with write access (the Action uses it)',
+      '  promptwheel pr-allow < comments.json         print the newest `sawbuck-allow: <reason>` from a PR comment by someone with write access (the Action uses it;',
+      '                                               --author <login> leaves out the account that opened the PR, unless the contract at --base <ref> says "allowFromAuthor": true)',
       '  promptwheel run --allow "<reason>"           acknowledge an intentional test/config change (or a `Promptwheel-Allow: <reason>` commit trailer; `Sawbuck-Allow:` is an alias): recorded, not flagged GAMED. With more than one thing to let through, the reason names each: --allow "tests_pass, contract-frozen: <reason>"',
       '',
       'Exit codes: 0 pass · 1 fail (a guarded metric regressed, or a mandate was violated) · 2 gamed · 3 inconclusive · 64 usage or config error (never a verdict).',

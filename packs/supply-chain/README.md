@@ -30,7 +30,7 @@ clean git worktrees, so a pack that is not in git is absent at both refs and the
 - **lock_drift**: structural items the tree has that `promptwheel.lock.json` does not. `promptwheel lock` reads the repo once and writes its shape: dependencies, install scripts, workflows, modules, import edges between modules, routes, public entry points, and the network hosts the source names. It also records each script's body, native binaries, and what a module can do (network, process spawning, eval), so a new capability shows even when the host is built at runtime. Ordinary edits never touch it. A new route is locked but not counted by default (`node .promptwheel/packs/supply-chain/lock.mjs drift . --list` shows it). To hold new routes too, add `--routes` to the end of the `lock_drift` metric's `cmd` in `promptwheel.config.json`, so it reads `node .promptwheel/packs/supply-chain/lock.mjs drift . --routes`. The flag belongs to that script: `promptwheel lock` takes no flags and always writes routes into the lock. The config is a frozen path here, so that edit passes with `promptwheel run --allow "<reason>"`. On 1,403 commits across eight repositories this guard would have stopped 5.1%, about one in 20. JS and TS only for edges, routes, hosts and capabilities today.
 - **pins_changed**: a fingerprint of the resolved dependency tree, compared base to head, because a new version under an old name is how a worm arrives. It covers every package, version, source and integrity, not the file's bytes, so a release of your own project does not count. Any change needs a reason. Nothing is stored, so the lock does not change across updates and an approved update does not blind the next check. On the same commits this stopped 8.7%, dependency changes; use the CI path below for those.
 
-**On a pull request.** Someone with write access comments `sawbuck-allow: <reason>` and re-runs the check. When more than one thing needs a reason, the comment names each one, and the check's own comment shows the line to copy. `sawbuck contract` marks everyday guards `report: true`, so they note a change without failing until you tighten them; this preset on its own holds them all.
+**On a pull request.** Someone with write access who did not open the pull request comments `sawbuck-allow: <reason>`, and the check is run again. The account that opened it does not count: a coding agent run from a service account opens its pull requests from that account. In a repo with one person in it, `"allowFromAuthor": true` in the contract on the base branch lets the opener count. When more than one thing needs a reason, the comment names each one, and the check's own comment shows the line to copy. `sawbuck contract` marks everyday guards `report: true`, so they note a change without failing until you tighten them; this preset on its own holds them all.
 
 **Dependency updates in CI.** Give the reason from a step the agent cannot reach. Workflows are a frozen path, so an agent cannot edit this:
 
@@ -78,13 +78,13 @@ metrics say, and a mandate deleted or narrowed in the same change that violates 
 
 | mandate | paths | why |
 | --- | --- | --- |
-| workflows-frozen | `.github/workflows/**` | workflows run with the repository's secrets |
 | registry-config-frozen | `.npmrc`, `.yarnrc`, `.yarnrc.yml` | where packages come from and where tokens go |
 | build-images-frozen | `Dockerfile*`, `docker-compose*` | what runs at build and deploy time |
 | publish-scripts-frozen | `scripts/release*`, `scripts/publish*` | the publish path is how a compromise spreads |
 | codeowners-frozen | `CODEOWNERS` | review ownership is set by people |
 | scanner-frozen | `.promptwheel/packs/**` | the scanners are not edited by the change they read |
 | contract-frozen | `promptwheel.config.json`, `sawbuck.config.json` | the contract changes with a reason from a person (`--allow`) |
+| workflows-frozen | `.github/workflows/**` | workflows run with the repository's secrets; they change with a reason from a person (`--allow`) |
 | lock-frozen | `promptwheel.lock.json` | the lock changes with a reason from a person (`--allow`) |
 | hooks-frozen | `.claude/settings.json`, `.claude/settings.local.json`, `.sawbuck/**` | the hooks change with a reason from a person (`--allow`) |
 
@@ -92,9 +92,15 @@ The contract itself (`promptwheel.config.json`, `sawbuck.config.json`) is frozen
 `evaluatorPaths` entry. A change to it needs `--allow "<reason>"` from a person. Without that, a change that
 only weakens a rule would pass, and the next change would be judged by the weakened contract.
 
-`--allow` clears only three of these: `contract-frozen`, `lock-frozen` and `hooks-frozen` (so a team can commit
-shared hooks to a repo that already has its rules). A commit trailer clears none. Every other frozen path stays
-frozen, even with `--allow`. To change one, a person first retires its mandate in a change of its own
+`--allow` clears four of these: `contract-frozen`, `lock-frozen`, `hooks-frozen` (so a team can commit shared
+hooks to a repo that already has its rules) and, since 0.8.10, `workflows-frozen`. A workflow change is ordinary
+upkeep: on 340 real commits from 17 public repos, 65 were sent back for a protected path, 64 of those for a
+workflow, and 20 changed only an action's version. A rule with no way through but deleting it teaches people to
+delete it. A new workflow file is also a change to the repo's shape, so its reason names `lock_drift` too; the
+check prints the line to copy. On a pull request the reason comes from someone with write access who did not open it. A commit
+trailer clears none. A contract written before 0.8.10 holds its own copy of `workflows-frozen` without the key,
+and an update does not change it: add `"allowable": "flag"` to that rule to get the same (an edit to the
+contract, so it takes `--allow`). Every other frozen path stays frozen, even with `--allow`. To change one, a person first retires its mandate in a change of its own
 (it edits the contract, so it needs `--allow`), then makes the change, then puts the mandate back the
 same way.
 

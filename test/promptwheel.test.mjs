@@ -76,9 +76,9 @@ test('renderMarkdown: with more than one thing to accept, the comment to copy na
   const base = { base: 'a', head: 'b', mode: 'refs', repeat: 1, verdict: 'fail',
     metrics: [{ name: 'dependency_entries', guard: true, before: 1, after: 2, delta: 1, status: 'regressed', confidence: 'high', ok: false, allowable: true }],
     explained: [{ metric: 'dependency_entries', noted: false, what: 'a new dependency', allowable: true }] };
-  assert.match(renderMarkdown({ ...base, allowable: ['dependency_entries'] }), /comment `sawbuck-allow: <your reason>` on this PR/, 'one thing: no name needed');
+  assert.match(renderMarkdown({ ...base, allowable: ['dependency_entries'] }), /who did not open this PR comments `sawbuck-allow: <their reason>` on it/, 'one thing: no name needed');
   const two = renderMarkdown({ ...base, allowable: ['dependency_entries', 'mandate:lock-frozen'], allowed: { reason: 'dependency_entries: needed', cleared: ['dependency_entries'] } });
-  assert.match(two, /comment `sawbuck-allow: dependency_entries, lock-frozen: <your reason>` on this PR/);
+  assert.match(two, /who did not open this PR comments `sawbuck-allow: dependency_entries, lock-frozen: <their reason>` on it/);
   assert.match(two, /\*\*Allowed:\*\* `dependency_entries`/); assert.match(two, /\*\*Not let through:\*\* `mandate:lock-frozen`/);
   const none = renderMarkdown({ ...base, allowable: ['dependency_entries', 'mandate:lock-frozen'], allowed: { reason: 'looks fine', cleared: [] } });
   assert.doesNotMatch(none, /\*\*Allowed:\*\*/); assert.match(none, /\*\*Not let through:\*\* `dependency_entries`, `mandate:lock-frozen`/);
@@ -731,6 +731,32 @@ test('supply-chain gate: a lifecycle script, a dependency or a non-registry lock
   rmSync(d, { recursive: true, force: true });
 });
 
+// A workflow change is ordinary upkeep (an action version bump, a new job): on 17 real repos 61 of 320 commits by
+// people touched a protected path, nearly all of them a workflow. A rule with no way through but deleting the rule
+// teaches people to delete the rule. So it takes a person's reason, like the contract's own file: by the flag, and on
+// a pull request by a comment from someone who did not open it. Never by a commit message.
+test('the preset: a workflow change takes a reason from a person, by the flag; a trailer does not clear it; the registry file stays frozen', () => {
+  const d = mkdtempSync(join(tmpdir(), 'pw-wf-'));
+  const g = (a) => execFileSync('git', a, { cwd: d, stdio: 'ignore' });
+  g(['init', '-q']); g(['config', 'user.email', 'a@b.c']); g(['config', 'user.name', 'a']);
+  writeFileSync(join(d, 'package.json'), JSON.stringify({ name: 'a', scripts: { test: 'node -e 0' } }));
+  mkdirSync(join(d, '.github/workflows'), { recursive: true }); writeFileSync(join(d, '.github/workflows/ci.yml'), 'name: ci\non: push\njobs: {}\n'); commitAll(d, 'base');
+  assert.equal(pw(d, ['init', '--preset', 'supply-chain', '--no-agent-block']).code, 0); commitAll(d, 'sign');
+  const rule = JSON.parse(readFileSync(join(d, 'promptwheel.config.json'), 'utf8')).mandates.find((m) => m.name === 'workflows-frozen');
+  assert.equal(rule.allowable, 'flag', 'written into the contract, where a person can read it'); assert.match(rule.reason, /with a reason from a person \(--allow\)/);
+  const run = (...extra) => { const r = pw(d, ['run', '--base', 'HEAD~1', '--head', 'HEAD', '--no-record', '--json', ...extra]); return { code: r.code, rep: JSON.parse(r.out.slice(r.out.indexOf('{'))) }; };
+  writeFileSync(join(d, '.github/workflows/ci.yml'), 'name: ci\non: push\njobs: { a: { runs-on: ubuntu-latest, steps: [] } }\n'); commitAll(d, 'ci: a job');
+  let r = run(); assert.equal(r.code, 1, 'with no reason it fails as before'); assert.equal(r.rep.mandates[0].name, 'workflows-frozen');
+  assert.ok((r.rep.allowable || []).includes('mandate:workflows-frozen'), 'and the report says a reason would clear it');
+  r = run('--allow', 'the CI job, reviewed'); assert.equal(r.code, 0, JSON.stringify(r.rep.allowed));
+  assert.ok(r.rep.allowed.cleared.includes('mandate:workflows-frozen')); assert.match(r.rep.allowed.reason, /the CI job, reviewed/, 'the reason is on the record');
+  g(['commit', '-q', '--amend', '-m', 'ci: a job\n\nPromptwheel-Allow: the CI job, reviewed']);
+  assert.equal(run().code, 1, 'a commit message is not a person: a trailer does not clear a workflow change');
+  writeFileSync(join(d, '.npmrc'), 'registry=https://example.invalid/\n'); commitAll(d, 'npmrc');
+  r = run('--allow', 'registry-config-frozen: I want this'); assert.equal(r.code, 1, 'where packages come from keeps no way through but retiring its rule'); assert.equal(r.rep.mandates[0].name, 'registry-config-frozen');
+  rmSync(d, { recursive: true, force: true });
+});
+
 // ---------------------- the newcomer's first cheat: gut the tests, metric stays flat
 test('default init config: weakening the suite (flat metric) FAILS via tripwires', () => {
   const d = mkdtempSync(join(tmpdir(), 'pw-gut-'));
@@ -823,6 +849,7 @@ test('run: the hint on a protected path says how to accept it: --allow for a rul
   execFileSync('git', ['init', '-q'], { cwd: d });
   execFileSync('git', ['config', 'user.email', 't@t'], { cwd: d }); execFileSync('git', ['config', 'user.name', 't'], { cwd: d });
   writeFileSync(join(d, 'package.json'), JSON.stringify({ name: 'x' }));
+  mkdirSync(join(d, '.github/workflows'), { recursive: true }); writeFileSync(join(d, '.github/workflows/x.yml'), 'on: push\n');
   assert.equal(pw(d, ['init', '--preset', 'supply-chain', '--no-agent-block']).code, 0);
   commitAll(d, 'contract');
   const f = join(d, 'promptwheel.config.json');
@@ -832,8 +859,24 @@ test('run: the hint on a protected path says how to accept it: --allow for a rul
   assert.match(r.out, /"contract-frozen" accepts a person's declared reason: promptwheel run --allow "<reason>"/);
   assert.doesNotMatch(r.out, /retire the mandate/, 'the config is the protected path: "retire it in the config" is no way out');
   assert.equal(pw(d, ['run', '--base', 'HEAD~1', '--head', 'HEAD', '--allow', 'more repeats']).code, 0);
-  mkdirSync(join(d, '.github/workflows'), { recursive: true }); writeFileSync(join(d, '.github/workflows/x.yml'), 'on: push\n');
+  // a workflow change takes a reason too, since 0.8.10
+  writeFileSync(join(d, '.github/workflows/x.yml'), 'on: [push, pull_request]\n');
+  commitAll(d, 'edit a workflow');
+  r = pw(d, ['run', '--base', 'HEAD~1', '--head', 'HEAD']);
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /"workflows-frozen" accepts a person's declared reason: promptwheel run --allow "<reason>"/);
+  assert.doesNotMatch(r.out, /retire the mandate/);
+  // a NEW workflow file is also a change to the repo's shape, so its reason names both, and the hint gives the line
+  writeFileSync(join(d, '.github/workflows/y.yml'), 'on: workflow_dispatch\n');
   commitAll(d, 'add a workflow');
+  r = pw(d, ['run', '--base', 'HEAD~1', '--head', 'HEAD']);
+  assert.equal(r.code, 1, r.out);
+  assert.match(r.out, /"workflows-frozen" accepts a person's declared reason: promptwheel run --allow "lock_drift, workflows-frozen: <reason>"/);
+  assert.equal(pw(d, ['run', '--base', 'HEAD~1', '--head', 'HEAD', '--allow', 'a manual job']).code, 1, 'one reason, one thing');
+  assert.equal(pw(d, ['run', '--base', 'HEAD~1', '--head', 'HEAD', '--allow', 'lock_drift, workflows-frozen: a manual job']).code, 0);
+  // where packages come from does not
+  writeFileSync(join(d, '.npmrc'), 'registry=https://example.invalid/\n');
+  commitAll(d, 'point at another registry');
   r = pw(d, ['run', '--base', 'HEAD~1', '--head', 'HEAD']);
   assert.equal(r.code, 1, r.out);
   assert.match(r.out, /a mandate is a hard rule; if the change is truly intended, retire the mandate/);
@@ -2579,6 +2622,89 @@ test('pr-allow: reads every page gh prints (one comment per line), so the newest
   assert.match(action, /gh api --paginate "repos\/\$REPO\/issues\/\$PR\/comments\?per_page=100" --jq '\.\[\]'/, 'the Action reads every page, not the oldest 100');
 });
 
+// 0.8.10: who may let a pull request through. Until now the newest `sawbuck-allow:` comment from any account of type
+// User with write access counted, the account that opened the pull request included. A coding agent run from a
+// service account (a GitHub machine user: a User, with a token that writes pull requests) opens its pull requests
+// from that account, and the check's own comment spells out the words to post. Run with the Action's own steps
+// (proof-bench/pr-shapes, 2026-11-14): the opener's comment let a gamed green through, and let a pull request that
+// rewrote its own contract through. The opener's own comment no longer counts, unless the contract on the BASE
+// branch says a repo with one person in it wants that.
+test('approval on a PR: the account that opened it does not count, in any letter case; another person does', () => {
+  const c = (body, login, assoc = 'COLLABORATOR', type = 'User') => ({ body, author_association: assoc, user: { type, login } });
+  const opener = { author: 'acme-agent-svc' };
+  assert.equal(allowFromComments([c('sawbuck-allow: it is fine', 'acme-agent-svc')], opener), '', 'the opener');
+  assert.equal(allowFromComments([c('sawbuck-allow: it is fine', 'Acme-Agent-SVC')], opener), '', 'the opener, in another letter case');
+  assert.equal(allowFromComments([c('sawbuck-allow: I looked', 'pat', 'MEMBER')], opener), 'I looked (approved by pat)', 'another person');
+  assert.equal(allowFromComments([c('sawbuck-allow: I looked', 'pat', 'MEMBER'), c('sawbuck-allow: it is fine', 'acme-agent-svc')], opener), 'I looked (approved by pat)', 'a newer comment from the opener does not hide a person\'s');
+  assert.equal(allowFromComments([c('sawbuck-allow: it is fine', 'acme-agent-svc'), c('sawbuck-allow: I looked', 'pat', 'MEMBER')], opener), 'I looked (approved by pat)');
+  assert.equal(allowFromComments([c('sawbuck-allow: it is fine', 'acme-agent-svc')], { ...opener, allowFromAuthor: true }), 'it is fine (approved by acme-agent-svc)', 'where the base contract says the opener may');
+  assert.equal(allowFromComments([c('sawbuck-allow: it is fine', 'acme-agent-svc')]), 'it is fine (approved by acme-agent-svc)', 'with no opener named, as before (a caller that does not know who opened it)');
+  assert.equal(allowFromComments([c('sawbuck-allow: x', 'some-app[bot]', 'NONE', 'Bot')], opener), '', 'a bot still never counts');
+});
+test('pr-allow --author: the contract on the base branch decides whether the opener counts; the branch cannot say so for itself', () => {
+  const d = tmpRepo([{ name: 'tests_pass', cmd: 'true', extract: 'exit', direction: 'pass', guard: true }]); commitAll(d, 'base');
+  const base = rev(d);
+  const mine = JSON.stringify({ body: 'sawbuck-allow: it is fine', author_association: 'COLLABORATOR', user: { type: 'User', login: 'acme-agent-svc' } });
+  const theirs = JSON.stringify({ body: 'sawbuck-allow: I looked', author_association: 'MEMBER', user: { type: 'User', login: 'pat' } });
+  const note = join(d, '..', `note-${Date.now()}.md`);
+  const prAllow = (input, ...a) => { try { return execFileSync('node', [ENGINE, 'pr-allow', ...a], { cwd: d, input, encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] }); } catch (e) { return `EXIT ${e.status}`; } };
+  assert.equal(prAllow(mine + '\n', '--author', 'acme-agent-svc', '--base', base, '--note', note), '', 'the opener, and the base contract is silent');
+  const said = readFileSync(note, 'utf8'); assert.match(said, /acme-agent-svc/); assert.match(said, /opened/); assert.match(said, /allowFromAuthor/, 'the note says what was not counted, why, and the setting for a repo with one person in it');
+  assert.equal(prAllow(theirs + '\n' + mine + '\n', '--author', 'acme-agent-svc', '--base', base, '--note', note), 'I looked (approved by pat)');
+  assert.equal(readFileSync(note, 'utf8'), '', 'nothing to explain when a person let it through');
+  // the branch adds the setting: the base still decides
+  const cfgPath = join(d, 'promptwheel.config.json'); const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'));
+  writeFileSync(cfgPath, JSON.stringify({ ...cfg, allowFromAuthor: true })); commitAll(d, 'let the opener approve');
+  assert.equal(prAllow(mine + '\n', '--author', 'acme-agent-svc', '--base', base), '', 'added in the same change, it does not count for that change');
+  // once it is on the base, it counts
+  assert.equal(prAllow(mine + '\n', '--author', 'acme-agent-svc', '--base', rev(d)), 'it is fine (approved by acme-agent-svc)');
+  // and the change that adds it shows as a change to the gate
+  const r = pw(d, ['run', '--base', base, '--head', 'HEAD', '--no-record', '--no-auto', '--json']); assert.equal(JSON.parse(r.out).gate.changed, true, 'adding the setting is a change to the gate, and the report says so');
+  // no --author: as before
+  assert.equal(prAllow(mine + '\n'), 'it is fine (approved by acme-agent-svc)');
+});
+test('the Action hands pr-allow the account that opened the pull request and the base commit, and posts its note', () => {
+  const action = readFileSync(join(dirname(ENGINE), '..', 'action.yml'), 'utf8');
+  assert.match(action, /OPENER: \$\{\{ github\.event\.pull_request\.user\.login \}\}/, 'the opener comes from GitHub, in the environment, not typed into the script');
+  assert.match(action, /pr-allow --author "\$OPENER" --base "\$BASE" --note "\$RUNNER_TEMP\/promptwheel-allow-note\.md"/);
+  assert.match(action, /promptwheel-allow-note\.md" >> "\$RUNNER_TEMP\/promptwheel\.md"/, 'what was not counted is in the comment the check posts');
+});
+test('the report tells a reader who may accept it: someone with write access who did not open the pull request', () => {
+  const d = repoWith({ 'package.json': JSON.stringify({ name: 'a' }) });
+  assert.equal(pw(d, ['init', '--preset', 'supply-chain', '--no-agent-block']).code, 0); commitAll(d, 'sign');
+  writeFileSync(join(d, 'package.json'), JSON.stringify({ name: 'a', scripts: { postinstall: 'x' } })); commitAll(d, 'script');
+  const md = (extra = []) => pw(d, ['run', '--base', 'HEAD~1', '--head', 'HEAD', '--no-record', '--no-auto', '--markdown', ...extra]).out;
+  assert.match(md(), /To accept this, someone with write access who did not open this PR comments `sawbuck-allow: [^`]*<their reason>` on it, and the check is run again\./);
+  // a reason that names one of two things: the line about what was not let through says the same about who
+  assert.match(md(['--allow', 'lifecycle_scripts: we need it']), /To accept them all, someone with write access who did not open this PR comments `sawbuck-allow: [^`]*<their reason>`\./);
+  assert.doesNotMatch(md(), /<your reason>/, 'the reader of the comment may be the one who opened it');
+});
+
+// What the check borrows from the machine it runs on and no diff shows. Measured 2026-11-11 (proof-bench/outside-git): a
+// `PYTEST_ADDOPTS` that deselects the red test, and a preload in `NODE_OPTIONS` that forces a pass, each read pass while
+// a fresh install was red. Removing them could break a setup that needs them, so the check runs as it is told and says
+// so: a note, never a verdict. A variable the contract's own `env` sets is declared, and is not noted.
+test('a variable in the environment that can change which tests run is said, as a note and never a verdict', () => {
+  const d = tmpRepo([{ name: 'tests_pass', cmd: 'true', extract: 'exit', direction: 'pass', guard: true }]);
+  writeFileSync(join(d, 'preload.js'), ''); commitAll(d, 'base'); writeFileSync(join(d, 'x.txt'), '1'); commitAll(d, 'a change');
+  const clean = { ...process.env }; for (const k of ['PYTEST_ADDOPTS', 'PYTEST_PLUGINS', 'NODE_OPTIONS']) delete clean[k];
+  const run = (env, ...extra) => execFileSync('node', [ENGINE, 'run', '--base', 'HEAD~1', '--head', 'HEAD', '--no-record', '--no-auto', ...extra], { cwd: d, encoding: 'utf8', env: { ...clean, ...env } });
+  const rep = (env) => JSON.parse(run(env, '--json'));
+  const note = (r) => (r.explained || []).find((x) => x.metric === 'environment');
+  assert.equal(note(rep({})), undefined, 'nothing set, nothing said');
+  let r = rep({ PYTEST_ADDOPTS: '--deselect tests/test_a.py::test_red' });
+  assert.equal(r.verdict, 'pass', 'a note, never a verdict'); assert.equal(note(r).noted, true); assert.deepEqual(note(r).items, ['PYTEST_ADDOPTS']);
+  assert.deepEqual(note(rep({ PYTEST_PLUGINS: 'always_green' })).items, ['PYTEST_PLUGINS']);
+  assert.equal(note(rep({ NODE_OPTIONS: '--max-old-space-size=4096' })), undefined, 'a NODE_OPTIONS that loads nothing is not one');
+  assert.deepEqual(note(rep({ NODE_OPTIONS: '--require ./preload.js' })).items, ['NODE_OPTIONS'], 'a preload is');
+  assert.deepEqual(note(rep({ NODE_OPTIONS: '--max-old-space-size=4096 --import=./preload.js', PYTEST_ADDOPTS: '-k fast' })).items, ['PYTEST_ADDOPTS', 'NODE_OPTIONS']);
+  assert.match(run({ PYTEST_ADDOPTS: '-k fast' }, '--markdown'), /ℹ️ \*\*Note:\*\* the environment this ran in can change which tests run, or load code into them: `PYTEST_ADDOPTS`/);
+  assert.match(run({ PYTEST_ADDOPTS: '-k fast' }), /note: the environment this ran in can change which tests run, or load code into them: PYTEST_ADDOPTS/, 'and in the plain report');
+  // declared in the contract's own env: part of the gate, on the record, not a surprise
+  writeFileSync(join(d, 'promptwheel.config.json'), JSON.stringify({ linkNodeModules: false, env: { PYTEST_ADDOPTS: '-q' }, metrics: [{ name: 'tests_pass', cmd: 'true', extract: 'exit', direction: 'pass', guard: true }] })); commitAll(d, 'the contract sets it'); writeFileSync(join(d, 'x.txt'), '2'); commitAll(d, 'another change');
+  assert.equal(note(rep({ PYTEST_ADDOPTS: '-k fast' })), undefined, 'a variable the contract itself sets is not noted');
+});
+
 test('--allow on a gamed commit: the JSON and the PR comment both carry the reason and what it cleared', () => {
   const d = tmpRepo([{ name: 'tests_pass', cmd: 'sh test/a.sh', extract: 'exit', direction: 'pass', guard: true }]);
   mkdirSync(join(d, 'test'));
@@ -2828,3 +2954,71 @@ test('a test that prints an HTTP "Not found" is not read as a missing dependency
   for (const t of ['sh: 1: jest: not found', '/bin/sh: 1: vitest: not found', 'bash: tsc: command not found', "Error: Cannot find module 'left-pad'"]) assert.ok(MISSING_DEP.test(t), t);
 });
 
+
+// ---------------------- a person's own git settings, and file names git quotes
+// Every suite and every release check ran with a blank git config, so the engine had never met a ~/.gitconfig with a
+// line in it. Found 2026-11-15 on the published 0.8.9 (proof-bench/own-git): with diff.noprefix, an outside diff tool,
+// colour forced on or no context lines, the source-only patch did not apply. An honest fix then read "inconclusive",
+// and a gamed win with a source file touched was not sent back. A setting in the repo's own config reads the same to git.
+const ownGitRepo = (settings = [], src = 'calc.mjs', tst = 'calc.test.mjs') => {
+  const d = tmpRepo([{ name: 'tests_pass', cmd: `node --test "${tst}" 2>&1`, extract: 'exit', direction: 'pass', guard: true }]);
+  for (const [k, v] of settings) execFileSync('git', ['config', k, v], { cwd: d });
+  for (const f of [src, tst]) mkdirSync(join(d, dirname(f)), { recursive: true });
+  const up = dirname(tst) === '.' ? './' : '../'.repeat(tst.split('/').length - 1);
+  const testOf = (want) => `import { test } from 'node:test'; import assert from 'node:assert'; import { sub } from '${up}${src}'; test('sub', () => assert.strictEqual(sub(5, 3), ${want}));\n`;
+  writeFileSync(join(d, src), 'export const sub = (a, b) => a + b;\n');   // the bug: it should be a - b
+  writeFileSync(join(d, tst), testOf(2)); commitAll(d, 'base: red test, buggy source');
+  return {
+    d,
+    fix: () => { writeFileSync(join(d, src), 'export const sub = (a, b) => a - b;\n'); commitAll(d, 'fix the source'); },
+    game: () => { writeFileSync(join(d, tst), testOf(8)); writeFileSync(join(d, src), 'export const sub = (a, b) => a + b;\nexport const twice = (a) => a * 2;\n'); commitAll(d, 'edit the test to pass, and touch the source'); },
+    report: () => check({ repo: d, base: 'HEAD~1', head: 'HEAD' }),
+  };
+};
+for (const [k, v] of [['diff.noprefix', 'true'], ['diff.mnemonicPrefix', 'true'], ['color.ui', 'always'], ['color.diff', 'always'], ['diff.context', '0'], ['diff.external', 'no-such-diff-tool'], ['diff.renames', 'copies'], ['core.abbrev', '4']]) {
+  test(`own git: with ${k}=${v} an honest fix reads pass, and a gamed win that also touches a source file reads gamed`, () => {
+    const a = ownGitRepo([[k, v]]); a.fix(); assert.equal(a.report().verdict, 'pass', 'the honest fix');
+    const b = ownGitRepo([[k, v]]); b.game(); assert.equal(b.report().verdict, 'gamed', 'the gamed win');
+    rmSync(a.d, { recursive: true, force: true }); rmSync(b.d, { recursive: true, force: true });
+  });
+}
+// Git prints a name that holds a byte above 127, a double quote, a backslash or a tab inside quotes with the bytes
+// escaped ("src/a\303\261adir.mjs") unless it is asked for the names NUL-separated. Read as a line, that string is no
+// file: it matched no pathspec, so the source-only patch was empty and an honest fix in such a file read "gamed".
+test('own git: a file name with a byte above 127 in it: an honest fix reads pass, a gamed win reads gamed, and the report names the file as it is on disk', () => {
+  const a = ownGitRepo([], 'src/añadir.mjs', 'test/añadir.test.mjs'); a.fix();
+  const ra = a.report(); assert.equal(ra.verdict, 'pass', 'an honest fix in src/añadir.mjs');
+  const b = ownGitRepo([], 'src/añadir.mjs', 'test/añadir.test.mjs'); b.game();
+  const rb = b.report(); assert.equal(rb.verdict, 'gamed', 'a gamed win on test/añadir.test.mjs');
+  assert.doesNotMatch(JSON.stringify(rb), /\\\\303|\\\\261/, 'no escaped bytes in the report');
+  rmSync(a.d, { recursive: true, force: true }); rmSync(b.d, { recursive: true, force: true });
+});
+test('own git: a new workflow file is a protected path whatever its name holds (a byte above 127, a double quote, a tab)', { skip: process.platform === 'win32' && 'a double quote and a tab are not file-name characters on Windows' }, () => {
+  const d = mkdtempSync(join(tmpdir(), 'pw-wfname-'));
+  const g = (a) => execFileSync('git', a, { cwd: d, stdio: 'ignore' });
+  g(['init', '-q']); g(['config', 'user.email', 'a@b.c']); g(['config', 'user.name', 'a']);
+  writeFileSync(join(d, 'package.json'), JSON.stringify({ name: 'a', scripts: { test: 'node -e 0' } }));
+  mkdirSync(join(d, '.github/workflows'), { recursive: true }); writeFileSync(join(d, '.github/workflows/ci.yml'), 'name: ci\non: push\njobs: {}\n'); commitAll(d, 'base');
+  assert.equal(pw(d, ['init', '--preset', 'supply-chain', '--no-agent-block']).code, 0); commitAll(d, 'sign');
+  const run = () => { const r = pw(d, ['run', '--base', 'HEAD~1', '--head', 'HEAD', '--no-record', '--json']); return { code: r.code, rep: JSON.parse(r.out.slice(r.out.indexOf('{'))) }; };
+  for (const name of ['plain.yml', 'añadir.yml', 'it"s.yml', 'a\tb.yml']) {
+    writeFileSync(join(d, '.github/workflows', name), 'name: x\non: push\njobs: {}\n'); commitAll(d, `a new workflow: ${JSON.stringify(name)}`);
+    const r = run();
+    assert.equal(r.code, 1, `a new workflow named ${JSON.stringify(name)} fails with no reason`);
+    assert.ok((r.rep.mandates || []).some((m) => m.name === 'workflows-frozen'), `and it is the workflow rule that says so, for ${JSON.stringify(name)}: ${JSON.stringify(r.rep.mandates)}`);
+  }
+  rmSync(d, { recursive: true, force: true });
+});
+// A person's git hooks are for the person's own checkouts. The engine's throwaway worktrees ran them (post-checkout
+// fires on `git worktree add`), six times a check; one that exits 1 on a detached HEAD stopped every check ("could
+// not run"), so a gamed commit was not sent back, and each try left a worktree behind in the repo.
+test('own git: the engine\'s throwaway checkouts run none of the person\'s git hooks, so a post-checkout hook that fails does not stop the check, and no worktree is left behind', { skip: process.platform === 'win32' }, () => {
+  const a = ownGitRepo();
+  const hooks = mkdtempSync(join(tmpdir(), 'pw-hooks-'));
+  writeFileSync(join(hooks, 'post-checkout'), `#!/bin/sh\necho ran >> "${hooks}/log"\nexit 1\n`); chmodSync(join(hooks, 'post-checkout'), 0o755);
+  execFileSync('git', ['config', 'core.hooksPath', hooks], { cwd: a.d });
+  a.game(); assert.equal(a.report().verdict, 'gamed', 'the check ran, and read the gamed win');
+  assert.ok(!existsSync(join(hooks, 'log')), 'the hook did not run in a checkout the engine made');
+  assert.equal(execFileSync('git', ['worktree', 'list'], { cwd: a.d, encoding: 'utf8' }).trim().split('\n').length, 1, 'no worktree is left in the repo');
+  rmSync(a.d, { recursive: true, force: true }); rmSync(hooks, { recursive: true, force: true });
+});
