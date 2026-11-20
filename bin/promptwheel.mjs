@@ -14,7 +14,7 @@
 
 import { execSync, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readFileSync, writeFileSync, existsSync, mkdtempSync, symlinkSync, rmSync, mkdirSync, realpathSync, readdirSync, lstatSync, copyFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdtempSync, symlinkSync, rmSync, mkdirSync, realpathSync, readdirSync, lstatSync, copyFileSync, openSync, closeSync, appendFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, basename, isAbsolute, relative, sep, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -931,27 +931,142 @@ function readAllowTrailer(repo, ref, base) {
   return found.length ? { reason: [...new Set(found)].join(' | ').slice(0, 300) } : null;
 }
 
-// Which files a fallen count fell in, for whoever repairs it. Only for the tripwires `init` writes (a grep that prints
-// every match, counted): the same grep, counted by file, at both refs. Refs mode only: it checks out two commits.
+// ---- A change, read from the files it touched alone ---------------------------------------------------------------
+// A counting tripwire is a grep that prints every match, counted. Such a count is a sum over files, so the files a
+// change did not touch add the same number at both ends and cancel out. The reader writes only the touched files, as
+// they stood at each end, into two small folders, and runs the contract's OWN command there, counted by file: the same
+// patterns and the same file rules (--include, --exclude-dir) as the whole-tree count, so a contract signed with
+// older patterns is read with those. No commit is checked out, and no pattern is ported to another regex dialect.
+// Until 0.8.15 "where did it fall" checked out both commits again and counted the whole tree by file (3 to 22 seconds
+// on real pull requests). Held against the whole-tree counts on every pair of commits in proof-bench/outside-repos
+// (diffcount/RESULT.md). The verdict's own totals stay the whole-tree counts a contract was signed with.
+// A pull request's tree is a stranger's data: a path that would land outside the folder is not written (a tree can be
+// made by hand to hold ".."), a symlink is not written (grep -r follows none) and a submodule entry has no file.
 const TRIP_TAIL = /\|\s*wc -l\s*\|\s*tr -d " "\s*$/;
-function tripwireWhere(repo, base, head, def) {
-  if (!def || typeof def.cmd !== 'string' || !/^grep -rIoE /.test(def.cmd) || !TRIP_TAIL.test(def.cmd)) return null;
-  const byFile = def.cmd.replace(TRIP_TAIL, '| cut -d: -f1 | sort | uniq -c');
-  const at = (ref) => {
-    const wt = mkdtempSync(join(tmpBase(repo), tmpPrefix(repo, 'promptwheel')));
-    try {
-      addWorktree(repo, wt, ref);
-      const out = execSync(byFile, { cwd: wt, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024, timeout: 120000 });
-      return Object.fromEntries(out.split('\n').map((l) => l.match(/^\s*(\d+)\s+(.+)$/)).filter(Boolean).map((x) => [x[2].replace(/^\.\//, ''), +x[1]]));
-    } catch { return null; } finally { try { git(['worktree', 'remove', '--force', wt], repo); } catch { rmSync(wt, { recursive: true, force: true }); } }
+const isTripwire = (def) => !!def && typeof def.cmd === 'string' && /^grep -rIoE /.test(def.cmd) && TRIP_TAIL.test(def.cmd);
+const safeRel = (p) => !!p && !isAbsolute(p) && !p.split('/').some((s) => s === '' || s === '.' || s === '..') && !(sep === '\\' && /[\\:]/.test(p));
+// The file endings a set of commands can read at all, when every --include they hold is the plain "*.ext" kind: then a
+// change that adds a large binary writes none of it. Any other kind of --include, or a command with none: no filter.
+function readableEndings(defs) {
+  const ends = new Set();
+  for (const d of defs) {
+    const inc = d.cmd.match(/--include=\S+/g) || [];
+    if (!inc.length) return null;
+    for (const i of inc) { const m = /^--include="?\*(\.[A-Za-z0-9_+-]+)"?$/.exec(i); if (!m) return null; ends.add(m[1]); }
+  }
+  return [...ends];
+}
+// Blobs out of the object store, each to every path that needs it. Sizes are asked first: a small blob comes in a
+// batch, a large one is streamed straight to its file and never held in memory. Throws when an object is not here.
+const BLOB_STREAMED = 8 * 1024 * 1024, BLOB_BATCH = 48 * 1024 * 1024;
+function writeBlobs(repo, targets) {
+  const shas = [...targets.keys()];
+  if (!shas.length) return;
+  const put = (sha, buf) => { for (const to of targets.get(sha)) { mkdirSync(dirname(to), { recursive: true }); writeFileSync(to, buf); } };
+  const sized = execFileSync('git', ['cat-file', '--batch-check'], { cwd: repo, input: shas.join('\n') + '\n', encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'], maxBuffer: 256 * 1024 * 1024 }).split('\n').filter(Boolean).map((l) => l.split(' '));
+  if (sized.length !== shas.length) throw new Error('git answered for fewer objects than were asked');
+  let batch = [], held = 0;
+  const flush = () => {
+    if (!batch.length) return;
+    const buf = execFileSync('git', ['cat-file', '--batch'], { cwd: repo, input: batch.join('\n') + '\n', stdio: ['pipe', 'pipe', 'ignore'], maxBuffer: 2 * BLOB_BATCH + BLOB_STREAMED });
+    let at = 0;
+    for (const sha of batch) {
+      const nl = buf.indexOf(10, at); if (nl < 0) throw new Error('git stopped before every object was read');
+      const [name, type, size] = buf.toString('latin1', at, nl).split(' ');
+      if (name !== sha || type !== 'blob' || !/^\d+$/.test(size)) throw new Error(`object ${sha} is not a file here`);
+      put(sha, buf.subarray(nl + 1, nl + 1 + Number(size))); at = nl + 1 + Number(size) + 1;
+    }
+    batch = []; held = 0;
   };
-  const b = at(base), a = at(head);
-  if (!b || !a) return null;
+  sized.forEach(([name, type, size], i) => {
+    const sha = shas[i];
+    if (name !== sha || type !== 'blob' || !/^\d+$/.test(size)) throw new Error(`object ${sha} is not a file here`);
+    if (Number(size) > BLOB_STREAMED) {
+      const [first, ...rest] = targets.get(sha);
+      mkdirSync(dirname(first), { recursive: true });
+      const fd = openSync(first, 'w');
+      try { execFileSync('git', ['cat-file', 'blob', sha], { cwd: repo, stdio: ['ignore', fd, 'ignore'] }); } finally { closeSync(fd); }
+      for (const to of rest) { mkdirSync(dirname(to), { recursive: true }); copyFileSync(first, to); }
+    } else { batch.push(sha); held += Number(size); if (held >= BLOB_BATCH) flush(); }
+  });
+  flush();
+}
+// the contract's own command, counted by file instead of in all: { file: count }
+const countByFile = (dir, def, env) => {
+  const out = execSync(def.cmd.replace(TRIP_TAIL, '| cut -d: -f1 | sort | uniq -c'), { cwd: dir, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 256 * 1024 * 1024, timeout: 120000 });
+  return Object.fromEntries(out.split('\n').map((l) => l.match(/^\s*(\d+)\s+(.+)$/)).filter(Boolean).map((x) => [x[2].replace(/^\.\//, ''), +x[1]]));
+};
+// Map of metric name -> { file: [before, after] } for the tripwires among `defs`, over the files base..head touched.
+// null when the change could not be read (an object that is not in this clone, a file system that refuses a name):
+// then nothing is said about where, and the verdict is what it was.
+function readChange(repo, base, head, defs, cfg = {}) {
+  const trip = (defs || []).filter(isTripwire);
+  const out = new Map(trip.map((d) => [d.name, {}]));
+  if (!trip.length) return out;
+  let dir = '';
+  try {
+    const raw = execFileSync('git', ['diff-tree', '-r', '-z', '--raw', '--no-renames', '--no-abbrev', base, head], { cwd: repo, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 1024 * 1024 * 1024 }).split('\0');
+    const ends = readableEndings(trip), isFile = (mode) => mode === '100644' || mode === '100755';
+    const wants = [];
+    for (let i = 0; i + 1 < raw.length; i += 2) {
+      const m = /^:(\d{6}) (\d{6}) ([0-9a-f]{40,64}) ([0-9a-f]{40,64}) [A-Z]/.exec(raw[i]), path = raw[i + 1];
+      if (!m || !safeRel(path) || (ends && !ends.some((e) => path.endsWith(e)))) continue;
+      if (isFile(m[1])) wants.push(['b', m[3], path]);
+      if (isFile(m[2])) wants.push(['a', m[4], path]);
+    }
+    if (!wants.length) return out;
+    dir = mkdtempSync(join(tmpBase(repo), tmpPrefix(repo, 'promptwheel')));
+    const side = { b: join(dir, 'b'), a: join(dir, 'a') }; mkdirSync(side.b); mkdirSync(side.a);
+    const targets = new Map();
+    for (const [at, sha, path] of wants) {
+      const to = resolve(side[at], path);
+      if (!to.startsWith(side[at] + sep)) continue;   // belt and braces: nothing is written outside its side
+      if (!targets.has(sha)) targets.set(sha, []);
+      targets.get(sha).push(to);
+    }
+    writeBlobs(repo, targets);
+    const env = cfg.env ? { ...process.env, ...Object.fromEntries(Object.entries(cfg.env).map(([k, v]) => [k, String(v)])) } : process.env;
+    for (const d of trip) {
+      const b = countByFile(side.b, d, env), a = countByFile(side.a, d, env);
+      out.set(d.name, Object.fromEntries([...new Set([...Object.keys(b), ...Object.keys(a)])].sort().map((f) => [f, [b[f] || 0, a[f] || 0]])));
+    }
+    return out;
+  } catch { return null; } finally { if (dir) { try { rmSync(dir, { recursive: true, force: true }); } catch { /* self-heal takes it later */ } } }
+}
+// Which files a fallen count fell in, for whoever repairs it: the five where it fell furthest.
+function fellIn(files, def) {
   const down = def.direction === 'down';
-  const worse = [...new Set([...Object.keys(b), ...Object.keys(a)])].map((file) => ({ file, before: b[file] || 0, after: a[file] || 0 }))
+  const worse = Object.entries(files || {}).map(([file, [before, after]]) => ({ file, before, after }))
     .filter((x) => (down ? x.after > x.before : x.after < x.before))
     .sort((x, y) => Math.abs(y.after - y.before) - Math.abs(x.after - x.before) || (x.file < y.file ? -1 : 1));
   return worse.length ? worse.slice(0, 5) : null;
+}
+
+// A count that holds for the whole repo can still fall in one file: a test emptied of its assertions while another
+// file gains as many. For the two counts that go up (tests, assertions), when the total did NOT fall: the files that
+// stood at the base and hold fewer now. A file whose removed lines mostly turn up elsewhere in the same change was
+// moved or split, not cut, and is left out. A note for a reader (`lostIn`), never a verdict: an edit that swaps one
+// assertion for another in place is not seen by any count. The lines are read with the person's diff settings set
+// aside (an external diff tool, forced colour), and where they cannot be read nothing is said.
+const PER_FILE = new Set(['test_count', 'assertions']);
+function lostInFiles(repo, base, head, files, def, seen = {}) {
+  const worse = (fellIn(files, def) || []).filter((w) => w.before > 0);
+  if (!worse.length) return null;
+  const diff = (args) => execFileSync('git', ['diff', '--no-ext-diff', '--no-textconv', '--no-color', '--no-renames', '-U0', base, head, ...args], { cwd: repo, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 1024 * 1024 * 1024 }).split('\n');
+  const pick = (lines, sign) => lines.filter((l) => l[0] === sign && l[1] !== sign).map((l) => l.slice(1).trim()).filter((l) => l.length >= 12);
+  const tally = (lines) => { const t = new Map(); for (const l of lines) t.set(l, (t.get(l) || 0) + 1); return t; };
+  try {
+    if (!seen.added) seen.added = tally(pick(diff([]), '+'));   // every added line of the change, read once for both counts
+    const out = [];
+    for (const w of worse) {
+      const own = diff(['--', `:(literal)${w.file}`]);
+      const gone = pick(own, '-'), back = tally(pick(own, '+'));
+      const moved = gone.filter((l) => (seen.added.get(l) || 0) - (back.get(l) || 0) > 0).length;   // it turns up in another file
+      if (gone.length && moved * 2 >= gone.length) continue;
+      out.push({ file: w.file, before: w.before, after: w.after });
+    }
+    return out.length ? out : null;
+  } catch { return null; }
 }
 
 // A change is judged by the gate that was in force before it (`baseGate`: the config at base, or the
@@ -1226,7 +1341,17 @@ function gate(repo, opts) {
   }
   for (const m of guards) if (!m.allowed) m.allowable = true;   // failed, and a declared reason would clear it: say so in the report
   // for whoever repairs it, a person or a fix run: which files a fallen count fell in, and whether a reason in a commit is taken
-  if (!opts.working) for (const m of guards) if (!m.allowed && m.status === 'regressed') { const w = tripwireWhere(repo, base, head, (cfg.metrics || []).find((c) => c && c.name === m.name)); if (w) m.where = w; }
+  // both from the files the change touched alone (readChange): no commit is checked out a second time
+  if (!opts.working) {
+    const defOf = (name) => (cfg.metrics || []).find((c) => c && c.name === name);
+    const fell = guards.filter((m) => !m.allowed && m.status === 'regressed');
+    const held = metrics.filter((m) => PER_FILE.has(m.name) && m.guard && m.status !== 'regressed');
+    const defs = [...fell, ...held].map((m) => defOf(m.name)).filter(isTripwire);
+    const change = defs.length ? readChange(repo, base, head, defs, cfg) : null;
+    const seen = {};
+    if (change) for (const m of fell) { const w = change.has(m.name) && fellIn(change.get(m.name), defOf(m.name)); if (w) m.where = w; }
+    if (change) for (const m of held) { const w = change.has(m.name) && lostInFiles(repo, base, head, change.get(m.name), defOf(m.name), seen); if (w) m.lostIn = w; }
+  }
   const byCommit = opts.working || trailersOff() ? [] : guards.filter((m) => !m.allowed && mode.get(m.name) === true).map((m) => m.name);
   const mandated = mandateViolations.length > 0;
   const verdict = deriveVerdict(metrics, gateInfo, mandated);
@@ -1244,6 +1369,9 @@ function gate(repo, opts) {
     ...(allowable.length ? { allowable } : {}),
     ...(byCommit.length ? { byCommit } : {}),
     ...(Array.isArray(cfg.mandates) && cfg.mandates.length ? { protects: cfg.mandates.length } : {}),
+    // a repo with one person in it: the contract at the base says the account that opened a pull request may let it
+    // through, so the words about who can accept a change say that (read at the base, like pr-allow does)
+    ...(((gateDefAtRef(repo, base) || {}).scalars || {}).allowFromAuthor === true ? { openerCounts: true } : {}),
   };
   // a setup command that failed, at the ref it failed at: the usual reason a metric could not be measured
   const sb = setupFails.get(before), sa = setupFails.get(after);
@@ -1509,6 +1637,7 @@ function printHuman(r) {
     else if (m.inert) console.log(`      ⚠ "${m.name}" ${m.ran ? `ran and failed at the ${m.ran} ref and did not run at the other` : 'never ran (same value at both refs)'}: its command needs a build/deps first, or is not your real test command. Fix: promptwheel init, or set setup/linkDirs in promptwheel.config.json`);
     if (m.gamed === true) console.log(`      🚩 GAMED, ${m.gamingReason}`);
   }
+  for (const m of r.metrics || []) for (const w of m.lostIn || []) console.log(`  ℹ note: ${w.file} has ${PLAIN[m.name] || m.name} (${w.before} → ${w.after}), though the repo's total did not fall`);
   for (const x of r.explained || []) if (x.metric === 'environment') console.log(`  ℹ note: ${x.what}: ${x.items.join(', ')}`);
   if (r.setup) { const at = Object.keys(r.setup), f = r.setup[at[0]]; console.log(`  ⚠ setup failed (exit ${f.exit}) at the ${at.join(' and ')} ref${at.length > 1 ? 's' : ''}${f.lastLine ? ': ' + f.lastLine : ''}`); }
   if (r.gate && r.gate.weakened) for (const w of r.gate.weakened) console.log(w.change === 'measurement-edited'
@@ -1616,9 +1745,14 @@ function wayOut(r, fell, how) {
     ...(r.protects ? ['changing the workflow, the contract or this check is not a way through: those changes are sent back too'] : []),
   ];
 }
+// Who may accept a change on a pull request: someone who did not open it, or, where the contract on the base branch
+// says one person works here (`openerCounts`), anyone with write access, the opener included.
+const mdAccept = (r, all) => (r.openerCounts
+  ? `To accept ${all ? 'them all' : 'this'}, comment \`sawbuck-allow: ${allowNames(r)}<the reason>\` on this PR${all ? '' : ', and the check is run again'}. One person works in this repo, so a comment from the account that opened the PR counts.`
+  : `To accept ${all ? 'them all' : 'this'}, someone with write access who did not open this PR comments \`sawbuck-allow: ${allowNames(r)}<their reason>\`${all ? '' : ' on it, and the check is run again'}.`);
 function mdWayOut(r) {
   if (!r.explained.some((x) => !x.noted && x.allowable)) return [];
-  const accept = `To accept this, someone with write access who did not open this PR comments \`sawbuck-allow: ${allowNames(r)}<their reason>\` on it, and the check is run again.${allowNames(r) ? ' A reason lets through only what it names when there is more than one thing.' : ''}`;
+  const accept = `${mdAccept(r)}${allowNames(r) ? ' A reason lets through only what it names when there is more than one thing.' : ''}`;
   const fell = fallenTests(r);
   if (!fell.length) return ['>', `> ${accept}`];
   const { undo, job } = undoWords(fell);
@@ -1630,33 +1764,104 @@ function mdWayOut(r) {
       : [`> ${Undo}, and push. Or, if ${job} is the job:`, '>', `> ${accept}`]),
     ...(r.protects ? ['>', '> Changing the workflow, the contract or this check is not a way through: those changes are sent back too.'] : [])];
 }
-function renderMarkdown(r) {
-  const icon = r.verdict === 'pass' ? '✅' : r.verdict === 'gamed' ? '🚩' : r.verdict === 'inconclusive' ? '🟡' : '❌';
+// The comment is Sawbuck's: its name, and one link, to the one repo. What a reader has to do is in view; the table
+// of numbers is folded away (`fold: false` for the job summary, which nobody has to scroll past). The sentences
+// about how to get through are the ones measured on agents (proof-bench/pr-cause) and are not reworded here.
+const SAWBUCK_REPO = 'https://github.com/sawbuck-ai/sawbuck';
+const MD_FOOT = `<sub>[Sawbuck](${SAWBUCK_REPO}) checks what a change did to the tests. No model reads your code.</sub>`;
+const MD_HEADLINE = { pass: 'passes', fail: 'sent back', gamed: 'sent back', inconclusive: 'could not measure' };
+const MD_ICON = { pass: '✅', fail: '❌', gamed: '🚩', inconclusive: '🟡' };
+// A protected path that was touched, for a reader on a pull request: how a person accepts it, said once (under a
+// count that fell when there is one, else here). A path that takes no reason is not offered one. Until 0.8.15 the
+// comment named the path and stopped there, and a changed workflow is the most common send-back on ordinary work.
+function mdPathWayOut(r) {
+  const soft = r.mandates.filter((md) => md.allowable), hard = r.mandates.filter((md) => !md.allowable);
+  const saidBelow = !!(r.explained && mdWayOut(r).length);
+  return [
+    ...(soft.length && !saidBelow ? ['>', `> ${mdAccept(r)}${allowNames(r) ? ' A reason lets through only what it names when there is more than one thing.' : ''}`] : []),
+    ...(hard.length ? ['>', `> ${r.mandates.length > 1 ? hard.map((md) => `\`${md.name}\``).join(', ') : 'This protected path'} ${hard.length > 1 ? 'take' : 'takes'} no reason. To change it on purpose, a person first takes its rule out of \`promptwheel.config.json\`, in a change of its own.`] : []),
+  ];
+}
+function renderMarkdown(r, o = {}) {
   const sIcon = { improved: '🟢', regressed: '🔴', unchanged: '⚪', inconclusive: '🟡', unmeasurable: '⚫' };
   const rows = r.metrics.map((m) => {
     const d = m.delta == null ? 'n/a' : (m.delta > 0 ? `+${m.delta}` : `${m.delta}`);
     const status = m.gamed === true ? `🚩 gamed (${(m.retained * 100).toFixed(0)}% survives source-only)` : `${sIcon[m.status] || ''} ${m.status}${m.inert ? ' ⚠ never passes' : ''}`;
     return `| ${m.guard ? '🛡️ ' : ''}${m.name} | ${m.before} | ${m.after} | ${d} | ${status} | ${m.confidence} |`;
   }).join('\n');
+  const said = r.verdict === 'gamed' ? '> 🚩 A metric "improved" only because the agent edited tests/config/grader, not the source. The win does not survive a source-only re-run.' : r.verdict === 'fail' ? (r.mandates ? '> ⛔ A protected path changed. This is a hard rule; no metric result clears it.' : '> ❌ A 🛡️ guarded metric regressed beyond the noise band.') : r.verdict === 'inconclusive' ? (r.metrics.some((m) => m.inert) && r.metrics.every((m) => !m.inert || m.ran === 'both') ? '> 🟡 A 🛡️ guarded check is **inert**, it fails before and after this change, so nothing was actually verified. Fix it before trusting a pass.' : '> 🟡 A 🛡️ guarded check is **inert**, it never runs, so nothing was actually verified. Fix its command before trusting a pass.') : '> ✅ No guarded metric regressed.';
+  // a gamed win and a check that measured nothing have no "needs a look" line of their own: their sentence stays in view
+  const inView = r.verdict === 'gamed' || r.verdict === 'inconclusive';
+  const lost = r.metrics.flatMap((m) => (m.lostIn || []).map((w) => `> ℹ️ **Note:** \`${w.file}\` has ${PLAIN[m.name] || m.name} (${w.before} → ${w.after}), though the repo's total did not fall.`));
+  const table = ['| metric | before | after | Δ | status | confidence |', '|---|--:|--:|--:|---|---|', rows, ...(inView ? [] : ['', said])].join('\n');
+  const span = `${r.base} → ${r.head}`, rest = `${r.repeat > 1 ? `, ×${r.repeat}` : ''}, verdict ${r.verdict.toUpperCase()}`;
+  const would = o.commentOnly && o.wouldFail;
   return [
-    `### ${icon} PromptWheel, outcome gate: **${r.verdict.toUpperCase()}**`,
-    '',
-    `\`${r.base} → ${r.head}\` · ${r.mode} mode${r.repeat > 1 ? ` · ×${r.repeat}` : ''}`,
-    '',
-    ...(r.mandates ? [r.mandates.map((md) => `> ⛔ **Protected path touched:** \`${md.name}\`${md.reason ? ': ' + md.reason : ''} (touched \`${md.files.join('`, `')}\`)${md.removed ? ' (deleted in this same change; it stays in force for the change that removes it)' : md.edited ? ' (edited in this same change; the version before the change stays in force for the change that edits it)' : ''}`).join('\n'), ''] : []),
-    ...(r.explained ? [...r.explained.map((x) => `> ${x.noted ? 'ℹ️ **Note:**' : '✋ **Needs a look:**'} ${x.what}${x.items ? ': `' + x.items.join('`, `') + '`' : ''}`), ...mdWayOut(r), ''] : []),
-    '| metric | before | after | Δ | status | confidence |',
-    '|---|--:|--:|--:|---|---|',
-    rows,
-    '',
-    r.verdict === 'gamed' ? '> 🚩 A metric "improved" only because the agent edited tests/config/grader, not the source. The win does not survive a source-only re-run.' : r.verdict === 'fail' ? (r.mandates ? '> ⛔ A protected path changed. This is a hard rule; no metric result clears it.' : '> ❌ A 🛡️ guarded metric regressed beyond the noise band.') : r.verdict === 'inconclusive' ? (r.metrics.some((m) => m.inert) && r.metrics.every((m) => !m.inert || m.ran === 'both') ? '> 🟡 A 🛡️ guarded check is **inert**, it fails before and after this change, so nothing was actually verified. Fix it before trusting a pass.' : '> 🟡 A 🛡️ guarded check is **inert**, it never runs, so nothing was actually verified. Fix its command before trusting a pass.') : '> ✅ No guarded metric regressed.',
-    ...(r.gate && r.gate.weakened ? ['', `> 🚩 **Gate weakened:** ${r.gate.weakened.map((w) => `\`${w.name}\` ${w.change === 'guard-removed' ? 'removed' : w.change === 'guard-edited' ? 'edited' : w.change === 'measurement-edited' ? 'measured another way (setup, env or linked dirs)' : 'disabled'} (would have ${wouldHave(w.status)} at head)`).join('; ')}. The pass was bought by changing the gate, not by earning it.`] : []),
-    ...(r.allowed && r.allowed.cleared.length ? ['', `> ✓ **Allowed:** \`${r.allowed.cleared.join('`, `')}\` cleared by a declared reason: ${r.allowed.reason}`] : []),
-    ...(r.allowed && (r.allowable || []).some((l) => !r.allowed.cleared.includes(l)) ? ['', `> ✋ **Not let through:** \`${r.allowable.filter((l) => !r.allowed.cleared.includes(l)).join('`, `')}\`. A reason lets through only what it names when there is more than one thing. To accept them all, someone with write access who did not open this PR comments \`sawbuck-allow: ${allowNames(r)}<their reason>\`.`] : []),
-    ...(r.gate && r.gate.changed ? ['', `> ⚠ **Gate definition changed** in this diff (fingerprint \`${r.gate.fingerprint.base}\` -> \`${r.gate.fingerprint.head}\`): a metric, guard, evaluatorPath, mandate, or the setup, env or linked dirs they are measured with was added, removed or edited. Review the config change with the code.`] : []),
-    '',
-    '<sub>🛡️ = guard · _prove every change moved a metric_ · [PromptWheel](https://github.com/promptwheel-ai/promptwheel)</sub>',
-  ].join('\n');
+    // comment-only, on a run that would have failed the job: a send-back is called one; a check that measured nothing is not
+    `### ${would && r.verdict !== 'inconclusive' ? '✋' : MD_ICON[r.verdict] || '❌'} Sawbuck${would ? `, comment only: ${r.verdict === 'inconclusive' ? MD_HEADLINE.inconclusive : 'this would have been sent back'}` : `: ${MD_HEADLINE[r.verdict] || r.verdict}`}`,
+    ...(would ? ['This check only comments here. It never fails the job.'] : []),
+    ...(r.mandates ? [[...r.mandates.map((md) => `> ⛔ **Protected path touched:** \`${md.name}\`${md.reason ? ': ' + md.reason : ''} (touched \`${md.files.join('`, `')}\`)${md.removed ? ' (deleted in this same change; it stays in force for the change that removes it)' : md.edited ? ' (edited in this same change; the version before the change stays in force for the change that edits it)' : ''}`), ...mdPathWayOut(r)].join('\n')] : []),
+    ...(r.explained ? [[...r.explained.map((x) => `> ${x.noted ? 'ℹ️ **Note:**' : '✋ **Needs a look:**'} ${x.what}${x.items ? ': `' + x.items.join('`, `') + '`' : ''}`), ...mdWayOut(r)].join('\n')] : []),
+    ...(inView ? [said] : []),
+    ...(r.gate && r.gate.weakened ? [`> 🚩 **Gate weakened:** ${r.gate.weakened.map((w) => `\`${w.name}\` ${w.change === 'guard-removed' ? 'removed' : w.change === 'guard-edited' ? 'edited' : w.change === 'measurement-edited' ? 'measured another way (setup, env or linked dirs)' : 'disabled'} (would have ${wouldHave(w.status)} at head)`).join('; ')}. The pass was bought by changing the gate, not by earning it.`] : []),
+    ...(r.allowed && r.allowed.cleared.length ? [`> ✓ **Allowed:** \`${r.allowed.cleared.join('`, `')}\` cleared by a declared reason: ${r.allowed.reason}`] : []),
+    ...(r.allowed && (r.allowable || []).some((l) => !r.allowed.cleared.includes(l)) ? [`> ✋ **Not let through:** \`${r.allowable.filter((l) => !r.allowed.cleared.includes(l)).join('`, `')}\`. A reason lets through only what it names when there is more than one thing. ${mdAccept(r, true)}`] : []),
+    ...(r.gate && r.gate.changed ? [`> ⚠ **Gate definition changed** in this diff (fingerprint \`${r.gate.fingerprint.base}\` -> \`${r.gate.fingerprint.head}\`): a metric, guard, evaluatorPath, mandate, or the setup, env or linked dirs they are measured with was added, removed or edited. Review the config change with the code.`] : []),
+    ...(lost.length ? [lost.join('\n')] : []),
+    ...(o.note && String(o.note).trim() ? [String(o.note).trim()] : []),
+    o.fold === false ? `\`${span}\`${rest}\n\n${table}` : `<details><summary>What was measured (<code>${span}</code>${rest})</summary>\n\n${table}\n\n</details>`,
+    MD_FOOT,
+  ].join('\n\n');
+}
+
+// ---- The comment on a pull request: one, edited in place, and only when there is something to say -------------------
+// Until 0.8.15 the Action posted a new comment on every push, a pass included. A check that speaks on every push is
+// one a maintainer mutes, and then its one real sentence is not read either. So:
+// - It keeps ONE comment. It knows its own by a hidden first line that names the workflow and job, AND by its author
+//   (the Actions bot): a person who copies the line is not written over, and a second workflow has its own comment.
+// - It speaks when the job would fail, when a reason was used (that is the record), when a file lost tests or
+//   assertions while the total held, when the check's own definition changed, or when it could not run at all.
+// - A plain pass says nothing. The watch-notes of a full contract (a new dependency, the shape of the repo) and a note
+//   about the environment do not open a comment: they are in the job summary on every run, and in the comment when
+//   there is one. `comment: always` gives the whole report every time; `comment: false` gives none.
+// - A comment about an earlier push is never left standing on a push that passes: it is edited to one short line.
+// `commentOnly`: the job never fails, and the comment says what would have been sent back.
+// Pure: what to do is returned, and the Action's own shell does it. { action: 'none' | 'create' | 'update', id, body,
+// summary, wouldFail }.
+const BOT = 'github-actions[bot]';
+const markerFor = (key) => `<!-- sawbuck-check: ${String(key || '').replace(/[^A-Za-z0-9 _.\/-]/g, '').replace(/\s+/g, ' ').trim().slice(0, 80) || 'check'} -->`;
+export function commentPlan(input = {}) {
+  const { report = null, error = '', comments = [], note = '' } = input;
+  const exit = Number(input.exit) || 0, mode = String(input.comment ?? 'true'), commentOnly = input.commentOnly === true;
+  const wouldFail = exit !== 0 && !(exit === 3 && input.inconclusive === 'pass');
+  const marker = markerFor(input.key);
+  const mine = [...(comments || [])].reverse().find((c) => c && c.user && c.user.login === BOT && String(c.body || '').split('\n')[0].trim() === marker);
+  const readable = !!report && typeof report === 'object' && Array.isArray(report.metrics) && typeof report.verdict === 'string';
+  let full, speaks;
+  if (!readable) {
+    // the run did not get as far as a verdict (a config that cannot be read, a base commit that is not in the clone)
+    // the engine's own line when it wrote one (they begin with its name), else the last thing printed
+    const lines = String(error || '').replace(/\x1b\[[0-9;]*m/g, '').split('\n').map((l) => l.trim()).filter(Boolean);
+    const line = [...lines].reverse().find((l) => /^promptwheel\b/.test(l)) || lines[lines.length - 1] || '';
+    const why = line ? `> ${line.slice(0, 300)}` : '';
+    full = ['### ⚠️ Sawbuck: could not run', `Nothing was checked on this push${why ? ':' : '.'}`, ...(why ? [why] : []), ...(commentOnly ? ['This check only comments here. It never fails the job.'] : []), MD_FOOT].join('\n\n');
+    speaks = true;
+  } else {
+    speaks = wouldFail || !!(report.allowed && (report.allowed.cleared || []).length) || report.metrics.some((m) => m.lostIn && m.lostIn.length) || !!(report.gate && report.gate.changed);
+    full = null;
+  }
+  const render = (fold) => (readable ? renderMarkdown(report, { fold, commentOnly, wouldFail, note: wouldFail ? note : '' }) : full);
+  const summary = render(false);
+  if (mode === 'false') return { action: 'none', body: '', summary, wouldFail };
+  let text = '';
+  if (speaks || mode === 'always') text = render(true);
+  else if (mine) text = [`### ✅ Sawbuck: passes`, `Nothing to add on this push (\`${report.base} → ${report.head}\`). What this comment said about an earlier push is in its edit history.`, MD_FOOT].join('\n\n');
+  if (!text) return { action: 'none', body: '', summary, wouldFail };
+  // GitHub takes 65,536 characters in a comment and refuses a longer one whole: cut it, and say where the rest is
+  if (text.length > 60000) text = `${text.slice(0, 60000)}\n\n(Cut short: the whole report is in the job summary.)`;
+  const body = `${marker}\n${text}`;
+  if (mine && String(mine.body || '').trim() === body.trim()) return { action: 'none', body: '', summary, wouldFail };
+  return mine ? { action: 'update', id: mine.id, body, summary, wouldFail } : { action: 'create', body, summary, wouldFail };
 }
 
 function parseArgs(argv) {
@@ -1748,6 +1953,28 @@ export function check(options = {}) {
     detectGaming: options.detectGaming ?? true,
     allow: options.allow,
   });
+}
+
+// changeCounts(options) -> { [metric name]: { delta, files: { path: [before, after] } } | null } | null
+// The change in each counting tripwire between two commits, read from the files the change touched alone: no commit
+// is checked out and no test is run, so a caller can read every commit of a pull request in the time one check takes.
+// `delta` is after minus before, and equals the change in the whole-tree count. A metric that is not one of the
+// counting greps `init` writes reads null. The whole result is null when the change could not be read.
+//   repo, base, head, config: as for check()
+export function changeCounts(options = {}) {
+  let start = process.cwd();
+  if (options.repo) { try { start = realpathSync(options.repo); } catch { bad(`promptwheel: not inside a git repository (${options.repo})`); } }
+  const repo = repoRoot(start);
+  const cfg = options.config ?? loadConfig(repo);
+  if (!cfg || typeof cfg !== 'object' || !Array.isArray(cfg.metrics)) bad('promptwheel changeCounts: options.config.metrics must be an array');
+  const base = resolveBase(repo, options.base), head = options.head || 'HEAD';
+  ensureCommit(repo, base, 'base'); ensureCommit(repo, head, 'head');
+  const change = readChange(repo, base, head, cfg.metrics, cfg);
+  if (!change) return null;
+  return Object.fromEntries(cfg.metrics.filter((m) => m && m.name).map((m) => {
+    const files = change.get(m.name);
+    return [m.name, files ? { delta: Object.values(files).reduce((n, [b, a]) => n + a - b, 0), files } : null];
+  }));
 }
 
 // conformsToContract(report) -> { ok, errors }
@@ -1872,18 +2099,43 @@ function checkFlags(cmd, argv) {
 // --author <login>: the account that opened the pull request; its own comment does not count, unless the contract at
 // --base <ref> holds "allowFromAuthor": true (read from that commit, so a pull request cannot say so for itself).
 // --note <file>: when the only approval was the opener's, one line saying so, for the comment the check posts.
+// a JSON array, or one comment per line (every page `gh api --paginate --jq '.[]'` prints); [] when it cannot be read
+function readComments(text) {
+  const t = String(text || '').trim();
+  try { return [].concat(JSON.parse(t || '[]')); } catch { try { return t.split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; } }
+}
 async function prAllow(argv = []) {
   const val = (f) => { const i = argv.indexOf(f); return i > -1 && argv[i + 1] !== undefined && !String(argv[i + 1]).startsWith('--') ? String(argv[i + 1]) : ''; };
   const author = val('--author'), base = val('--base'), note = val('--note');
   let t = ''; process.stdin.setEncoding('utf8');
   for await (const chunk of process.stdin) t += chunk;
-  t = t.trim(); let c = [];
-  try { c = [].concat(JSON.parse(t || '[]')); } catch { try { c = t.split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { /* unreadable, no approval */ } }
+  const c = readComments(t);
   let own = false;
   if (author && base) { try { own = ((gateDefAtRef(process.cwd(), base) || {}).scalars || {}).allowFromAuthor === true; } catch { /* no contract at the base: the opener does not count */ } }
   const d = allowDecision(c, { author, allowFromAuthor: own });
   if (note) { try { writeFileSync(note, d.skipped && !d.reason ? `\n> ✋ **Not counted:** a \`sawbuck-allow:\` comment from \`${d.skipped}\`, the account that opened this pull request. Whoever opened a pull request cannot let it through. Someone else with write access can. In a repo with one person in it, set \`"allowFromAuthor": true\` in \`promptwheel.config.json\` on the base branch; a pull request cannot turn that on for itself.\n` : ''); } catch { /* the note is a courtesy */ } }
   process.stdout.write(d.reason);
+}
+
+// pr-comment: what the Action does with the comment, decided here so the Action's shell stays thin (commentPlan).
+// Prints one word: `none`, `create`, or `update:<comment id>`. Writes the comment to --body (empty for `none`) and
+// adds the whole report to --summary. A file that is missing or empty reads as nothing; a flag it does not know is a
+// usage error, so a typo in a workflow cannot switch comment-only off in silence.
+const PR_COMMENT_FLAGS = ['--report', '--exit', '--error', '--comments', '--key', '--note', '--comment', '--inconclusive', '--comment-only', '--body', '--summary'];
+function prComment(argv = []) {
+  const o = {};
+  for (let i = 0; i < argv.length; i += 2) {
+    if (!PR_COMMENT_FLAGS.includes(argv[i])) bad(`promptwheel pr-comment: unknown flag ${argv[i]} (it takes ${PR_COMMENT_FLAGS.join(', ')})`);
+    if (argv[i + 1] === undefined) bad(`promptwheel pr-comment: ${argv[i]} needs a value`);
+    o[argv[i].slice(2)] = String(argv[i + 1]);
+  }
+  for (const [k, ok] of [['comment', ['true', 'always', 'false']], ['inconclusive', ['fail', 'pass']], ['comment-only', ['true', 'false']]]) if (o[k] !== undefined && !ok.includes(o[k])) bad(`promptwheel pr-comment: --${k} is ${ok.join(' or ')} (got "${o[k]}")`);
+  const read = (f) => { try { return f ? readFileSync(f, 'utf8') : ''; } catch { return ''; } };
+  let report = null; try { report = JSON.parse(read(o.report)); } catch { /* the run printed no report: it could not run */ }
+  const p = commentPlan({ report, exit: o.exit, error: read(o.error), comments: readComments(read(o.comments)), key: o.key, note: read(o.note), comment: o.comment, inconclusive: o.inconclusive, commentOnly: o['comment-only'] === 'true' });
+  if (o.body) writeFileSync(o.body, p.body ? p.body + '\n' : '');
+  if (o.summary) { try { appendFileSync(o.summary, p.summary + '\n'); } catch { /* the summary is a courtesy */ } }
+  process.stdout.write(p.action === 'update' ? `update:${p.id}\n` : `${p.action}\n`);
 }
 
 // write or refresh the architecture lock from the tree as it stands. A person runs this: the lock file is
@@ -1901,6 +2153,7 @@ function dispatch() {
   if (cmd in COMMAND_FLAGS) checkFlags(cmd, rest);
   if (cmd === 'run') run(rest);
   else if (cmd === 'pr-allow') return prAllow(rest);
+  else if (cmd === 'pr-comment') prComment(rest);
   else if (cmd === 'init') init(rest);
   else if (cmd === 'lock') return lock(rest);
   else {
@@ -1919,6 +2172,7 @@ function dispatch() {
       '  promptwheel run --working                    gate uncommitted changes (incl. newly added files)',
       '  promptwheel pr-allow < comments.json         print the newest `sawbuck-allow: <reason>` from a PR comment by someone with write access (the Action uses it;',
       '                                               --author <login> leaves out the account that opened the PR, unless the contract at --base <ref> says "allowFromAuthor": true)',
+      '  promptwheel pr-comment --report <file> ...   what the Action does with its one comment on a pull request: prints none, create or update:<id>, and writes the comment (the Action uses it)',
       '  promptwheel run --allow "<reason>"           acknowledge an intentional test/config change (or a `Promptwheel-Allow: <reason>` commit trailer; `Sawbuck-Allow:` is an alias): recorded, not flagged GAMED. With more than one thing to let through, the reason names each: --allow "tests_pass, contract-frozen: <reason>"',
       '',
       'Exit codes: 0 pass · 1 fail (a guarded metric regressed, or a mandate was violated) · 2 gamed · 3 inconclusive · 64 usage or config error (never a verdict).',

@@ -2811,7 +2811,7 @@ test('the Action hands pr-allow the account that opened the pull request and the
   const action = readFileSync(join(dirname(ENGINE), '..', 'action.yml'), 'utf8');
   assert.match(action, /OPENER: \$\{\{ github\.event\.pull_request\.user\.login \}\}/, 'the opener comes from GitHub, in the environment, not typed into the script');
   assert.match(action, /pr-allow --author "\$OPENER" --base "\$BASE" --note "\$RUNNER_TEMP\/promptwheel-allow-note\.md"/);
-  assert.match(action, /promptwheel-allow-note\.md" >> "\$RUNNER_TEMP\/promptwheel\.md"/, 'what was not counted is in the comment the check posts');
+  assert.match(action, /pr-comment [\s\S]*--note "\$RUNNER_TEMP\/promptwheel-allow-note\.md"/, 'what was not counted is in the comment the check posts');
 });
 test('the report tells a reader who may accept it: someone with write access who did not open the pull request', () => {
   const d = repoWith({ 'package.json': JSON.stringify({ name: 'a' }) });
@@ -3179,7 +3179,9 @@ test('run: the missing-dependency hint names the file, not the bare error code a
   writeFileSync(join(d, 'note.txt'), 'x'); commitAll(d, 'b');
   const m = runJson(d).rep.metrics.find((x) => x.name === 'tests_pass');
   assert.equal(m.cause, 'missing-dependency');
-  assert.match(m.detail, /^Cannot find module .*not-here\.mjs.* imported from .*run\.mjs/, m.detail);
+  // the hint is cut at 200 characters, and where the temp folder's path is long (a Mac's, a sandbox's) the cut falls
+  // before the importing file. The file that is missing comes first, and that is what the hint is for.
+  assert.match(m.detail, /^Cannot find module .*not-here\.mjs/, m.detail);
   rmSync(d, { recursive: true, force: true });
 });
 
@@ -3334,4 +3336,296 @@ test('gate.goalposts: a report whose goalposts are empty is never gamed, on ever
   assert.equal(check({ repo: d, base: 'HEAD~1', head: 'HEAD', detectGaming: false }).gate, undefined, 'no gate record, so no goalposts, when detection is off');
   assert.equal(conformsToContract({ ...r, gate: { ...r.gate, goalposts: 'calc.test.mjs' } }).ok, false, 'goalposts must be an array of paths');
   rmSync(d, { recursive: true, force: true });
+});
+
+// ---- a count that holds for the repo can still fall in one file (proof-bench/outside-repos, gates/RESULT.md: four of
+// fifteen home-made gates read per file; the released 0.8.14 passed a test emptied of its assertions when another
+// file gained as many). A note on the metric, `lostIn`; never a verdict.
+const SPEC = (name, lines) => `const { test, expect } = require('./h');\ntest('${name}', () => {\n${lines.map((l) => '  ' + l).join('\n')}\n});\n`;
+const perFileRepo = (files) => {
+  const d = repoWith({ 'package.json': JSON.stringify({ name: 'a' }), 'src/a.js': 'exports.f = () => 1\n', ...files });
+  assert.equal(pw(d, ['init', '--no-agent-block']).code, 0);
+  const f = join(d, 'promptwheel.config.json'); const c = JSON.parse(readFileSync(f, 'utf8'));
+  writeFileSync(f, JSON.stringify({ ...c, metrics: c.metrics.map((m) => (m.name === 'tests_pass' ? { ...m, cmd: 'true' } : m)) }, null, 2)); commitAll(d, 'sign');
+  return d;
+};
+const PAY = ['expect(total(3, 4)).toBe(7);', 'expect(total(0, 0)).toBe(0);', 'expect(() => total(-1, 2)).toThrow(/negative/);'];
+const lostIn = (r, name) => (r.rep.metrics.find((m) => m.name === name) || {}).lostIn;
+test('a test file emptied of its assertions while another file gains as many: the total holds, and the file is named', () => {
+  const d = perFileRepo({ 'test/pay.test.js': SPEC('pay adds up', PAY) });
+  writeFileSync(join(d, 'test/pay.test.js'), SPEC('pay adds up', ['total(3, 4);']));
+  writeFileSync(join(d, 'test/other.test.js'), SPEC('other', ['expect(1).toBe(1);', 'expect(2).toBe(2);', 'expect(3).toBe(3);']));
+  commitAll(d, 'swap');
+  const r = gateRun(d);
+  assert.equal(r.rep.verdict, 'pass', 'a note, never a verdict');
+  assert.deepEqual(lostIn(r, 'assertions'), [{ file: 'test/pay.test.js', before: 3, after: 0 }]);
+  assert.equal(lostIn(r, 'test_count'), undefined, 'the test itself is still there');
+  assert.match(pw(d, ['run', '--base', 'HEAD~1', '--head', 'HEAD', '--no-record', '--no-auto']).out, /note: test\/pay\.test\.js has fewer assertions \(3 → 0\), though the repo's total did not fall/);
+});
+test('a test file moved, split in two, or left alone while tests are added: no file is named', () => {
+  const two = SPEC('pay adds up', PAY) + SPEC('pay refuses a bad sum', ['expect(() => total("a", 1)).toThrow(TypeError);', 'expect(() => total(null, 1)).toThrow(TypeError);']).split('\n').slice(1).join('\n');
+  let d = perFileRepo({ 'test/pay.test.js': two });
+  mkdirSync(join(d, 'test/billing')); execFileSync('git', ['mv', 'test/pay.test.js', 'test/billing/pay.test.js'], { cwd: d }); commitAll(d, 'move');
+  let r = gateRun(d); assert.equal(lostIn(r, 'assertions'), undefined, 'moved whole'); assert.equal(lostIn(r, 'test_count'), undefined);
+  d = perFileRepo({ 'test/pay.test.js': two });
+  writeFileSync(join(d, 'test/pay.test.js'), SPEC('pay adds up', PAY));
+  writeFileSync(join(d, 'test/pay-bad.test.js'), SPEC('pay refuses a bad sum', ['expect(() => total("a", 1)).toThrow(TypeError);', 'expect(() => total(null, 1)).toThrow(TypeError);']));
+  commitAll(d, 'split');
+  r = gateRun(d); assert.equal(lostIn(r, 'assertions'), undefined, 'split in two'); assert.equal(lostIn(r, 'test_count'), undefined);
+  d = perFileRepo({ 'test/pay.test.js': two });
+  writeFileSync(join(d, 'test/new.test.js'), SPEC('new', ['expect(9).toBe(9);'])); writeFileSync(join(d, 'src/a.js'), 'exports.f = () => 2\n'); commitAll(d, 'add');
+  r = gateRun(d); assert.equal(lostIn(r, 'assertions'), undefined, 'only additions');
+});
+
+// ---- 0.8.15: a change read from the files it touched alone (changeCounts). Where a count fell, and the per-file
+// note, used to check out both commits again and count the whole tree by file: 3 to 22 seconds on real pull requests
+// (proof-bench/outside-repos). A grep count is a sum over files, so the files a change did not touch cancel: only the
+// touched files are written out, as they stood at each end, and the contract's own command counts them.
+const engineNow = await import('../bin/promptwheel.mjs');
+const FOUR = ['test_count', 'skipped_tests', 'suppressions', 'assertions'];
+const readerRepo = () => {
+  const d = repoWith({
+    'package.json': JSON.stringify({ name: 'a' }), 'src/a.js': 'exports.f = () => 1\n',
+    'test/a.test.js': "test('one', () => { expect(1).toBe(1); expect(2).toBe(2); });\ntest('two', () => { expect(3).toBe(3); });\n",
+    'test/gone.test.js': "test('gone', () => { expect(4).toBe(4); });\nit('gone too', () => { assert.ok(1); });\n",
+    'test/moved.test.js': "test('moved', () => { expect(5).toBe(5); });\n",
+    'test/still.test.js': "test('still', () => { expect(6).toBe(6); });\n",
+    'docs/guide.md': 'Call it (once) and test (twice).\n',
+  });
+  assert.equal(pw(d, ['init', '--no-agent-block']).code, 0);
+  commitAll(d, 'sign');
+  return d;
+};
+const tripwireCfg = (d) => { const c = JSON.parse(readFileSync(join(d, 'promptwheel.config.json'), 'utf8')); return { ...c, metrics: c.metrics.filter((m) => FOUR.includes(m.name)) }; };
+const wholeTree = (d, base, head, config) => Object.fromEntries(check({ repo: d, base, head, config, detectGaming: false }).metrics.map((m) => [m.name, m.after - m.before]));
+test('changeCounts: the change in every count is the same as counting both whole trees, and no commit is checked out', () => {
+  const d = readerRepo(); const config = tripwireCfg(d); const base = rev(d);
+  writeFileSync(join(d, 'test/a.test.js'), "test('one', () => { expect(1).toBe(1); });\n");                      // a test and two assertions gone
+  writeFileSync(join(d, 'test/new.test.js'), "test('n1', () => { expect(7).toBe(7); });\nit.skip('n2', () => {});\n");   // added, one skipped
+  rmSync(join(d, 'test/gone.test.js'));                                                                          // deleted
+  mkdirSync(join(d, 'test/sub')); execFileSync('git', ['mv', 'test/moved.test.js', 'test/sub/moved.test.js'], { cwd: d });   // moved
+  mkdirSync(join(d, 'dist')); writeFileSync(join(d, 'dist/built.test.js'), "test('built', () => { expect(8).toBe(8); });\n");   // a folder the count leaves out
+  writeFileSync(join(d, 'docs/guide.md'), 'Call it (once), test (twice), describe (it), expect (nothing).\n');    // not a code file
+  writeFileSync(join(d, 'test/ñandú más.test.js'), "test('ñ', () => { expect(9).toBe(9); });\n");                  // a name git would quote
+  symlinkSync('a.test.js', join(d, 'test/link.test.js'));                                                         // a link: grep -r does not follow one
+  writeFileSync(join(d, 'src/a.js'), '// eslint-disable-next-line no-undef\nexports.f = () => 1\n');              // one more silenced check
+  commitAll(d, 'a change of every kind');
+  const whole = wholeTree(d, base, 'HEAD', config);
+  assert.deepEqual(whole, { test_count: -1, skipped_tests: 1, suppressions: 1, assertions: -2 }, 'the fixture moves all four counts');
+  const before = execFileSync('git', ['worktree', 'list'], { cwd: d, encoding: 'utf8' });
+  const got = engineNow.changeCounts({ repo: d, base, head: 'HEAD', config });
+  assert.deepEqual(Object.fromEntries(FOUR.map((n) => [n, got[n].delta])), whole);
+  assert.deepEqual(got.test_count.files['test/a.test.js'], [2, 1]);
+  assert.deepEqual(got.test_count.files['test/gone.test.js'], [2, 0]);
+  assert.deepEqual(got.test_count.files['test/ñandú más.test.js'], [0, 1], 'a name with a space and bytes above 127 is read as it is');
+  assert.equal(got.test_count.files['dist/built.test.js'], undefined, 'a folder the contract leaves out is left out here');
+  assert.equal(got.test_count.files['test/link.test.js'], undefined, 'a link is not read');
+  assert.equal(got.test_count.files['test/still.test.js'], undefined, 'a file the change did not touch is not read at all');
+  assert.equal(execFileSync('git', ['worktree', 'list'], { cwd: d, encoding: 'utf8' }), before);
+  rmSync(d, { recursive: true, force: true });
+});
+test('changeCounts: a count that is not a counting grep is not guessed at, and a change that touches no file reads zero', () => {
+  const d = readerRepo(); const config = tripwireCfg(d);
+  config.metrics.push({ name: 'todos', cmd: 'grep -rn TODO . --include=*.js 2>/dev/null | wc -l', extract: 'number', direction: 'down', guard: true });
+  const got = engineNow.changeCounts({ repo: d, base: 'HEAD', head: 'HEAD', config });
+  assert.equal(got.todos, null, 'only the tripwires init writes are read this way');
+  assert.deepEqual(got.test_count, { delta: 0, files: {} });
+  rmSync(d, { recursive: true, force: true });
+});
+test('changeCounts: a tree made by hand to climb out of the folder writes nothing outside it', () => {
+  const d = readerRepo(); const config = tripwireCfg(d);
+  const g = (args, input) => execFileSync('git', args, { cwd: d, input, encoding: 'utf8' }).trim();
+  const blob = g(['hash-object', '-w', '--stdin'], "test('escaped', () => { expect(1).toBe(1); });\n");
+  // a tree whose one entry is named "..", holding another "..", holding a test file: git makes no such tree on its
+  // own. Two steps up from a side folder is the temp folder itself.
+  const up = (tree) => execFileSync('git', ['hash-object', '-t', 'tree', '-w', '--literally', '--stdin'], { cwd: d, input: Buffer.concat([Buffer.from('40000 ..\0'), Buffer.from(tree, 'hex')]), encoding: 'utf8' }).trim();
+  const evil = up(up(g(['mktree'], `100644 blob ${blob}\tpw-escaped-${process.pid}.test.js\n`)));
+  assert.match(g(['diff-tree', '-r', '--name-only', 'HEAD', evil]), /^\.\.\/\.\.\/pw-escaped-/m, 'git itself names the path that climbs');
+  const commit = g(['commit-tree', evil, '-p', 'HEAD', '-m', 'a tree that climbs out']);
+  const landed = join(tmpdir(), `pw-escaped-${process.pid}.test.js`);
+  let got; assert.doesNotThrow(() => { got = engineNow.changeCounts({ repo: d, base: 'HEAD', head: commit, config }); });
+  assert.equal(existsSync(landed), false, 'nothing was written beside the scratch folder');
+  assert.ok(got === null || !Object.keys((got.test_count || {}).files || {}).some((f) => f.includes('..')), 'and the path is not counted');
+  rmSync(d, { recursive: true, force: true });
+});
+test('run: where a count fell is read from the change alone, and names the same files as before', () => {
+  const d = readerRepo();
+  writeFileSync(join(d, 'test/a.test.js'), "test('one', () => { expect(1).toBe(1); });\n"); rmSync(join(d, 'test/gone.test.js'));
+  writeFileSync(join(d, 'test/new.test.js'), "test('n1', () => {});\n"); commitAll(d, 'two files lose tests, one gains');
+  const log = join(TMP_ROOT, `git-calls-${process.pid}.log`); const bin = mkdtempSync(join(TMP_ROOT, 'gitlog-'));
+  const real = execFileSync('sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
+  writeFileSync(join(bin, 'git'), `#!/bin/sh\necho "$*" >> ${JSON.stringify(log)}\nexec ${JSON.stringify(real)} "$@"\n`); chmodSync(join(bin, 'git'), 0o755);
+  const r = spawnSync('node', [ENGINE, 'run', '--base', 'HEAD~1', '--head', 'HEAD', '--json', '--no-record', '--no-auto'], { cwd: d, encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH}` } });
+  const rep = JSON.parse(r.stdout);
+  assert.deepEqual(rep.metrics.find((m) => m.name === 'test_count').where, [{ file: 'test/gone.test.js', before: 2, after: 0 }, { file: 'test/a.test.js', before: 2, after: 1 }]);
+  const adds = readFileSync(log, 'utf8').split('\n').filter((l) => /worktree add/.test(l)).length;
+  assert.equal(adds, 2, `the two commits are checked out once each, for the measure itself, and never again to say where (${adds} checkouts)`);
+  rmSync(d, { recursive: true, force: true });
+});
+
+// ---- 0.8.15: the comment on a pull request. Until now the Action posted a new comment on every push, a pass
+// included, titled "PromptWheel, outcome gate", with a link to the engine (run on the released 0.8.14: ten pushes,
+// ten comments). Now: ONE comment, edited in place, and only when there is something to say. It is Sawbuck's, with
+// one link, to the one repo. The sentences that tell a fix run how to get through are the measured ones, unchanged.
+const prRep = (over = {}) => ({ base: 'aaa1111', head: 'bbb2222', mode: 'refs', repeat: 1, verdict: 'pass',
+  metrics: [{ name: 'tests_pass', guard: true, before: 1, after: 1, delta: 0, status: 'unchanged', confidence: 'high', ok: true }], ...over });
+const FELL = { name: 'test_count', guard: true, before: 3, after: 2, delta: -1, status: 'regressed', confidence: 'high', ok: false, allowable: true, where: [{ file: 'test/a.test.js', before: 2, after: 1 }] };
+const sentBack = (over = {}) => prRep({ verdict: 'fail', metrics: [prRep().metrics[0], FELL], explained: [{ metric: 'test_count', noted: false, what: 'fewer tests', allowable: true }], allowable: ['test_count'], protects: 9, ...over });
+const KEY = 'Sawbuck/contract';
+const botComment = (id, body, key = KEY) => ({ id, body: `<!-- sawbuck-check: ${key} -->\n${body}`, user: { login: 'github-actions[bot]', type: 'Bot' } });
+const plan = (o) => engineNow.commentPlan({ key: KEY, comments: [], ...o });
+test('the comment is Sawbuck\'s: its name, one link to the one repo, the numbers folded away, the measured sentences as they were', () => {
+  const md = renderMarkdown(sentBack());
+  assert.match(md, /^### ❌ Sawbuck: sent back$/m);
+  assert.doesNotMatch(md, /PromptWheel|promptwheel-ai|outcome gate/);
+  assert.deepEqual(md.match(/\]\(https?:[^)]*\)/g), ['](https://github.com/sawbuck-ai/sawbuck)'], 'one link, to the one repo');
+  assert.ok(md.indexOf('<details>') > 0 && md.indexOf('<details>') < md.indexOf('| metric |') && md.indexOf('| metric |') < md.indexOf('</details>'), 'the table sits inside the fold');
+  assert.ok(md.indexOf('Put back what was removed, and push') < md.indexOf('<details>'), 'what to do is in view');
+  assert.match(md, /> \*\*Where:\*\* `test\/a\.test\.js` \(2 → 1\)/);
+  assert.match(md, /> Put back what was removed, and push\. Or, if removing it is the job:\n>\n> To accept this, someone with write access who did not open this PR comments `sawbuck-allow: <their reason>` on it, and the check is run again\./);
+  assert.match(md, /verdict FAIL/, 'the engine\'s own word for it is still there, with the numbers');
+  assert.match(renderMarkdown(prRep({ verdict: 'gamed', metrics: [{ ...prRep().metrics[0], status: 'improved', gamed: true, retained: 0 }] })), /^### 🚩 Sawbuck: sent back\n\n> 🚩 A metric "improved" only because/m, 'a gamed win says why in view, not in the fold');
+  assert.doesNotMatch(renderMarkdown(sentBack(), { fold: false }), /<details>/, 'the job summary gets it unfolded');
+});
+test('a comment only when there is something to say: ten passing pushes leave none, and a pass with only watch-notes leaves none', () => {
+  const comments = [{ id: 1, body: 'looks good to me', user: { login: 'pat', type: 'User' } }];
+  for (let push = 0; push < 10; push++) { const p = plan({ report: prRep({ head: `bbb000${push}` }), exit: 0, comments }); assert.equal(p.action, 'none', `push ${push}`); assert.equal(p.body, ''); }
+  const noted = prRep({ explained: [{ metric: 'dependency_entries', noted: true, what: 'a new dependency' }, { metric: 'environment', noted: true, what: 'the environment this ran in can change which tests run, or load code into them', items: ['PYTEST_ADDOPTS'] }] });
+  assert.equal(plan({ report: noted, exit: 0 }).action, 'none', 'a new dependency as a note, or a note about the environment, does not open a comment');
+  assert.match(plan({ report: noted, exit: 0 }).summary, /a new dependency/, 'it is in the job summary, on every run');
+  assert.match(plan({ report: prRep(), exit: 0 }).summary, /\| metric \|/); assert.doesNotMatch(plan({ report: prRep(), exit: 0 }).summary, /<details>/);
+});
+test('one comment, edited in place: a send-back makes it, the next push edits it, and the fix edits it to a short passing line', () => {
+  const first = plan({ report: sentBack(), exit: 1 });
+  assert.equal(first.action, 'create'); assert.match(first.body, /^<!-- sawbuck-check: Sawbuck\/contract -->\n### ❌ Sawbuck: sent back/);
+  const thread = [{ id: 7, body: 'why is this red?', user: { login: 'pat', type: 'User' } }, botComment(41, first.body.split('\n').slice(1).join('\n'))];
+  const second = plan({ report: sentBack({ head: 'ccc3333' }), exit: 1, comments: thread });
+  assert.deepEqual([second.action, second.id], ['update', 41], 'the same comment, not a second one'); assert.match(second.body, /ccc3333/);
+  const fixed = plan({ report: prRep({ head: 'ddd4444' }), exit: 0, comments: thread });
+  assert.deepEqual([fixed.action, fixed.id], ['update', 41], 'a comment that said "sent back" is not left standing on a pull request that passes');
+  assert.match(fixed.body, /^<!-- sawbuck-check: Sawbuck\/contract -->\n### ✅ Sawbuck: passes\n\nNothing to add on this push \(`aaa1111 → ddd4444`\)\. What this comment said about an earlier push is in its edit history\./);
+  assert.doesNotMatch(fixed.body, /\| metric \|/, 'short: no table');
+  const again = plan({ report: prRep({ head: 'ddd4444' }), exit: 0, comments: [botComment(41, fixed.body.split('\n').slice(1).join('\n'))] });
+  assert.equal(again.action, 'none', 'the same words are not posted twice');
+});
+test('the one comment is known by its hidden line AND its author: a person who copies the line is not written over, and another workflow has its own', () => {
+  const copied = { id: 9, body: `<!-- sawbuck-check: ${KEY} -->\n### ✅ Sawbuck: passes`, user: { login: 'mallory', type: 'User' } };
+  assert.equal(plan({ report: sentBack(), exit: 1, comments: [copied] }).action, 'create');
+  assert.equal(plan({ report: prRep(), exit: 0, comments: [copied] }).action, 'none');
+  const other = botComment(12, 'x', 'PromptWheel/outcome-gate');
+  assert.equal(plan({ report: sentBack(), exit: 1, comments: [other] }).action, 'create', 'a second workflow that uses the Action keeps its own comment');
+  assert.deepEqual([plan({ report: sentBack(), exit: 1, comments: [botComment(3, 'a'), other, botComment(5, 'b')] }).id], [5], 'the newest of its own');
+  assert.match(plan({ report: sentBack(), exit: 1, key: 'a --> <b>\nc' }).body, /^<!-- sawbuck-check: a -- bc -->\n/, 'a name cannot close the hidden line');
+});
+test('what counts as something to say: a reason that was used, a file that lost its tests, the check\'s own definition changed', () => {
+  const allowed = prRep({ allowed: { reason: 'the rule it checked went (approved by pat)', cleared: ['test_count'] }, allowable: ['test_count'] });
+  let p = plan({ report: allowed, exit: 0 }); assert.equal(p.action, 'create'); assert.match(p.body, /### ✅ Sawbuck: passes\n\n> ✓ \*\*Allowed:\*\* `test_count` cleared by a declared reason: the rule it checked went \(approved by pat\)/);
+  const lost = prRep({ metrics: [prRep().metrics[0], { name: 'assertions', guard: true, before: 9, after: 9, delta: 0, status: 'unchanged', confidence: 'high', ok: true, lostIn: [{ file: 'test/pay.test.js', before: 3, after: 0 }] }] });
+  p = plan({ report: lost, exit: 0 }); assert.equal(p.action, 'create');
+  assert.match(p.body, /> ℹ️ \*\*Note:\*\* `test\/pay\.test\.js` has fewer assertions \(3 → 0\), though the repo's total did not fall\./);
+  p = plan({ report: prRep({ gate: { changed: true, fingerprint: { base: 'f1', head: 'f2' } } }), exit: 0 }); assert.equal(p.action, 'create'); assert.match(p.body, /Gate definition changed/);
+});
+test('comment: always gives the whole report on every run, still in one comment; comment: false gives none', () => {
+  let p = plan({ report: prRep(), exit: 0, comment: 'always' }); assert.equal(p.action, 'create'); assert.match(p.body, /### ✅ Sawbuck: passes/); assert.match(p.body, /\| metric \|/);
+  p = plan({ report: prRep({ head: 'eee5555' }), exit: 0, comment: 'always', comments: [botComment(2, 'x')] }); assert.deepEqual([p.action, p.id], ['update', 2]);
+  assert.equal(plan({ report: sentBack(), exit: 1, comment: 'false' }).action, 'none');
+  assert.match(plan({ report: sentBack(), exit: 1, comment: 'false' }).summary, /sent back/, 'the job summary still has it');
+});
+test('could not measure: a comment where that fails the job, none where the workflow says it passes', () => {
+  const inc = prRep({ verdict: 'inconclusive', metrics: [{ ...prRep().metrics[0], before: 0, after: 0, inert: true }] });
+  let p = plan({ report: inc, exit: 3, inconclusive: 'fail' }); assert.equal(p.action, 'create'); assert.match(p.body, /### 🟡 Sawbuck: could not measure\n\n> 🟡 A 🛡️ guarded check is \*\*inert\*\*/);
+  p = plan({ report: inc, exit: 3, inconclusive: 'pass' }); assert.equal(p.action, 'none'); assert.match(p.summary, /could not measure/);
+});
+test('comment-only: the comment says what would have been sent back, and that this check never fails the job here', () => {
+  let p = plan({ report: sentBack(), exit: 1, commentOnly: true });
+  assert.equal(p.action, 'create'); assert.equal(p.wouldFail, true);
+  assert.match(p.body, /### ✋ Sawbuck, comment only: this would have been sent back\n\nThis check only comments here\. It never fails the job\.\n\n> ✋ \*\*Needs a look:\*\* fewer tests/);
+  p = plan({ report: prRep(), exit: 0, commentOnly: true }); assert.equal(p.action, 'none'); assert.equal(p.wouldFail, false);
+  // a check that measured nothing is not called a send-back: it says what it is
+  p = plan({ report: prRep({ verdict: 'inconclusive', metrics: [{ ...prRep().metrics[0], before: 0, after: 0, inert: true }] }), exit: 3, inconclusive: 'fail', commentOnly: true });
+  assert.match(p.body, /### 🟡 Sawbuck, comment only: could not measure\n\nThis check only comments here\. It never fails the job\./);
+  p = plan({ report: null, exit: 64, error: 'some warning\npromptwheel: promptwheel.config.json is not valid JSON (Unexpected token } at 12)\n', commentOnly: true });
+  assert.equal(p.action, 'create'); assert.match(p.body, /### ⚠️ Sawbuck: could not run\n\nNothing was checked on this push:\n\n> promptwheel: promptwheel\.config\.json is not valid JSON \(Unexpected token \} at 12\)/);
+  assert.match(plan({ report: null, exit: 64, error: '' }).body, /could not run/, 'with comment-only off too: a red job says why');
+});
+test('what was not counted is said in the comment; and where the base contract says one person works here, the way through says so', () => {
+  const note = '\n> ✋ **Not counted:** a `sawbuck-allow:` comment from `acme-agent-svc`, the account that opened this pull request.\n';
+  assert.match(plan({ report: sentBack(), exit: 1, note }).body, /\*\*Not counted:\*\* a `sawbuck-allow:` comment from `acme-agent-svc`/);
+  assert.doesNotMatch(plan({ report: prRep(), exit: 0, comments: [botComment(4, 'x')], note }).body, /Not counted/, 'nothing needed a reason on a push that passes');
+  const solo = renderMarkdown(sentBack({ openerCounts: true }));
+  assert.match(solo, /> To accept this, comment `sawbuck-allow: <the reason>` on this PR, and the check is run again\. One person works in this repo, so a comment from the account that opened the PR counts\./);
+  assert.doesNotMatch(solo, /who did not open this PR/);
+});
+test('pr-comment: the command the Action runs prints what to do, writes the comment and the summary, and refuses a flag it does not know', () => {
+  const d = mkdtempSync(join(TMP_ROOT, 'prc-')); const f = (n) => join(d, n);
+  writeFileSync(f('report.json'), JSON.stringify(sentBack())); writeFileSync(f('comments.jsonl'), ''); writeFileSync(f('summary.md'), 'earlier step\n');
+  const run = (...a) => spawnSync('node', [ENGINE, 'pr-comment', '--report', f('report.json'), '--comments', f('comments.jsonl'), '--key', KEY, '--body', f('body.md'), '--summary', f('summary.md'), ...a], { encoding: 'utf8' });
+  let r = run('--exit', '1'); assert.equal(r.status, 0, r.stderr); assert.equal(r.stdout.trim(), 'create');
+  assert.match(readFileSync(f('body.md'), 'utf8'), /^<!-- sawbuck-check: Sawbuck\/contract -->\n### ❌ Sawbuck: sent back/);
+  assert.match(readFileSync(f('summary.md'), 'utf8'), /^earlier step\n[\s\S]*Sawbuck: sent back/, 'the summary is added to, never written over');
+  writeFileSync(f('comments.jsonl'), JSON.stringify({ id: 1, body: 'hi', user: { login: 'pat', type: 'User' } }) + '\n' + JSON.stringify(botComment(88, 'old')) + '\n');
+  assert.equal(run('--exit', '1').stdout.trim(), 'update:88');
+  writeFileSync(f('report.json'), JSON.stringify(prRep())); writeFileSync(f('comments.jsonl'), '');
+  r = run('--exit', '0'); assert.equal(r.stdout.trim(), 'none'); assert.equal(readFileSync(f('body.md'), 'utf8'), '');
+  r = run('--exit', '0', '--comment-only', 'true'); assert.equal(r.stdout.trim(), 'none', 'a pass is a pass in comment-only too');
+  writeFileSync(f('report.json'), ''); writeFileSync(f('err.txt'), 'promptwheel: base ref "x" is not in this clone\n');
+  r = run('--exit', '64', '--error', f('err.txt')); assert.equal(r.stdout.trim(), 'create'); assert.match(readFileSync(f('body.md'), 'utf8'), /could not run[\s\S]*base ref "x" is not in this clone/);
+  r = run('--exit', '1', '--coment', 'always'); assert.equal(r.status, 64); assert.match(r.stderr, /unknown flag --coment/);
+  rmSync(d, { recursive: true, force: true });
+});
+test('the Action: comments read once, one comment made or edited, comment-only never fails the job', () => {
+  const action = readFileSync(join(dirname(ENGINE), '..', 'action.yml'), 'utf8');
+  assert.match(action, /^  comment-only:\n    description: /m);
+  assert.match(action, /pr-comment --report "\$RUNNER_TEMP\/promptwheel\.json"/);
+  assert.match(action, /gh api -X PATCH "repos\/\$REPO\/issues\/comments\/\$\{PLAN#update:\}"/, 'an earlier comment is edited in place');
+  assert.match(action, /KEY: \$\{\{ github\.workflow \}\}\/\$\{\{ github\.job \}\}/);
+  // Two pushes close together: the run for the first posts while the run for the second is still measuring. A list
+  // taken when the job began does not hold that comment, and the second run posted beside it (found by letting the
+  // stand-in for gh add a comment between the steps: 2 comments where 1 is allowed).
+  assert.equal((action.match(/gh api --paginate/g) || []).length, 2, 'read for the approval when the job begins, and again just before the check speaks');
+  assert.ok(action.indexOf('promptwheel-comments-now.jsonl') > action.indexOf('promptwheel.mjs" run'), 'the second reading comes after the measuring');
+  assert.match(action, /pr-comment [\s\S]*--comments "\$RUNNER_TEMP\/promptwheel-comments-now\.jsonl"/, 'and it is the one the comment is planned from');
+  assert.match(action, /if \[ "\$COMMENT_ONLY" = true \]; then[\s\S]*exit 0/, 'comment-only: the last step passes whatever the verdict');
+  assert.doesNotMatch(action, /gh pr comment "\$\{\{/, 'no comment is posted without the plan');
+});
+test('the report says when the opener\'s own comment counts: the contract at the base decides, a change cannot say so for itself', () => {
+  const d = tmpRepo([{ name: 'tests_pass', cmd: 'true', extract: 'exit', direction: 'pass', guard: true }]); commitAll(d, 'base');
+  const cfgPath = join(d, 'promptwheel.config.json'); const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'));
+  writeFileSync(join(d, 'a.js'), '1\n'); commitAll(d, 'a change');
+  assert.equal(gateRun(d).rep.openerCounts, undefined, 'a contract that does not say so');
+  writeFileSync(cfgPath, JSON.stringify({ ...cfg, allowFromAuthor: true })); commitAll(d, 'one person here');
+  assert.equal(gateRun(d).rep.openerCounts, undefined, 'the change that adds the setting is judged without it');
+  writeFileSync(join(d, 'a.js'), '2\n'); commitAll(d, 'the next change');
+  const r = gateRun(d); assert.equal(r.rep.openerCounts, true); assert.equal(conformsToContract(r.rep).ok, true);
+  rmSync(d, { recursive: true, force: true });
+});
+// Found while testing sawbuck contract --solo (2026-11-20): a changed workflow file is the most common send-back on
+// ordinary work (proof-bench/outside-repos: over half), and the comment for it named the path and never said how a
+// person accepts it on a pull request. The way through was printed only under a count that fell.
+test('a protected path sent back on a pull request says how to accept it; one that takes no reason says what a person does first', () => {
+  const soft = { name: 'workflows-frozen', reason: 'workflows run with the repository secrets', files: ['.github/workflows/ci.yml'], allowable: 'flag' };
+  const hard = { name: 'registry-config-frozen', reason: 'registry and token configuration decides where packages come from', files: ['.npmrc'] };
+  let md = renderMarkdown(prRep({ verdict: 'fail', mandates: [soft], allowable: ['mandate:workflows-frozen'], protects: 9 }));
+  assert.match(md, /> ⛔ \*\*Protected path touched:\*\* `workflows-frozen`[^\n]*\n>\n> To accept this, someone with write access who did not open this PR comments `sawbuck-allow: <their reason>` on it, and the check is run again\./);
+  assert.ok(md.indexOf('To accept this') < md.indexOf('<details>'), 'in view, not in the fold');
+  md = renderMarkdown(prRep({ verdict: 'fail', mandates: [soft], allowable: ['mandate:workflows-frozen'], openerCounts: true }));
+  assert.match(md, /> To accept this, comment `sawbuck-allow: <the reason>` on this PR, and the check is run again\. One person works in this repo/);
+  md = renderMarkdown(prRep({ verdict: 'fail', mandates: [hard] }));
+  assert.doesNotMatch(md, /sawbuck-allow/, 'a path that takes no reason is not offered one');
+  assert.match(md, /> This protected path takes no reason\. To change it on purpose, a person first takes its rule out of `promptwheel\.config\.json`, in a change of its own\./);
+  md = renderMarkdown(prRep({ verdict: 'fail', mandates: [soft, hard], allowable: ['mandate:workflows-frozen'] }));
+  assert.match(md, /sawbuck-allow: <their reason>/); assert.match(md, /> `registry-config-frozen` takes no reason\. To change it on purpose/);
+  // with a count that fell too, the way through is said once, and names each thing
+  md = renderMarkdown(sentBack({ mandates: [soft], allowable: ['test_count', 'mandate:workflows-frozen'] }));
+  assert.equal(md.match(/To accept this/g).length, 1); assert.match(md, /`sawbuck-allow: test_count, workflows-frozen: <their reason>`/);
+  // a reason was given and let it through: nothing is asked
+  md = renderMarkdown(prRep({ allowed: { reason: 'the step is harmless (approved by pat)', cleared: ['mandate:workflows-frozen'] }, allowable: ['mandate:workflows-frozen'] }));
+  assert.doesNotMatch(md, /To accept this/);
+});
+test('a comment longer than GitHub takes is cut short and says where the rest is, so it is still posted', () => {
+  const many = Array.from({ length: 4000 }, (_, i) => `.github/workflows/generated-workflow-number-${i}.yml`);
+  const p = plan({ report: prRep({ verdict: 'fail', mandates: [{ name: 'workflows-frozen', reason: 'workflows run with the repository secrets', files: many, allowable: 'flag' }], allowable: ['mandate:workflows-frozen'] }), exit: 1 });
+  assert.equal(p.action, 'create'); assert.ok(p.body.length < 65000, `${p.body.length} characters`);
+  assert.match(p.body, /\(Cut short: the whole report is in the job summary\.\)\n*$/);
+  assert.ok(p.summary.length > p.body.length, 'the job summary has all of it');
 });

@@ -1,5 +1,7 @@
 # PromptWheel
 
+PromptWheel is the engine inside Sawbuck. If you came for the tool, start at [github.com/sawbuck-ai/sawbuck](https://github.com/sawbuck-ai/sawbuck).
+
 [![CI](https://github.com/promptwheel-ai/promptwheel/actions/workflows/ci.yml/badge.svg)](https://github.com/promptwheel-ai/promptwheel/actions/workflows/ci.yml) [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE) ![Node ≥18](https://img.shields.io/badge/node-%E2%89%A518-brightgreen) ![deps: zero](https://img.shields.io/badge/deps-zero-blue)
 
 **A deterministic, zero-LLM check for your coding loop.** A green test should mean your agent *fixed the code*, not that it edited the test to match the bug. PromptWheel re-proves every win from the agent's source edits alone, so a test that went from red to green because the test, grader or declared config changed reads `GAMED`. The code being checked never gets to grade itself.
@@ -146,7 +148,7 @@ writes `promptwheel.lock.json` (the shape of the repo, from `promptwheel lock`) 
 
 ## In CI and in Claude Code
 
-**GitHub Action.** Drop this in your repo; it posts a verdict comment on every PR and fails the check on a guarded regression, a gamed win, or an inconclusive gate:
+**GitHub Action.** Drop this in your repo. It fails the check on a guarded regression, a gamed win, or an inconclusive gate, and says why in one comment on the pull request, which it edits in place. A pull request that passes with nothing to note gets no comment:
 
 ```yaml
 # .github/workflows/promptwheel.yml
@@ -163,7 +165,7 @@ jobs:
         with: { repeat: '3' }
 ```
 
-The Action runs straight from its own checkout, no npm install, no build. See [`action.yml`](action.yml); a copy-paste workflow file lives at [`examples/github-action.yml`](examples/github-action.yml). Make the check a branch-protection requirement and the agent cannot merge past it.
+The Action runs straight from its own checkout, no npm install, no build. See [`action.yml`](action.yml); a copy-paste workflow file lives at [`examples/github-action.yml`](examples/github-action.yml). Make the check a branch-protection requirement and the agent cannot merge past it. To try it first, add `comment-only: true` under `with:`. Then the job never fails, and the comment says what would have been sent back.
 
 **Claude Code plugin.** Bring the gate in as slash commands (the plugin wraps the CLI, so install that too: `npm i -g promptwheel`):
 
