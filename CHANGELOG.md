@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.8.14 (2026-11-17): a cost that a gain pays for
+
+A guard is a wall: the metric may not get worse. A loop that improves something by itself, with no person to ask, needs a rate as well. Google's RRSI paper (arXiv 2609.24972) measured the loop without one: it paid 2.4 times the tokens and gained almost nothing on tasks it had not seen.
+
+- **`budget` on a guard.** `{ "gain": "score", "base": 0.10, "rate": 0.2 }` lets a trusted regression of that metric through when the named metric improved in the same change, by a share of the old value no larger than `base + rate x gain`. The report says what paid, or by how much it went over. With no trusted gain, nothing changes: the guard fails as it did.
+- **A gain the source did not earn pays for nothing.** The rule runs after the source-only re-run.
+- **The counts read code files only.** Found by replaying the contract on 408 real pull requests: a docs-only change was sent back for fewer tests (the words "it (" in a Markdown sentence), and a removed dependency for fewer assertions (the word assert in a lock file). Tests in Go, Rust, Ruby, Java, C#, Elixir and Swift are now counted. A contract signed before this keeps the commands it was signed with.
+- **A fall in the tests says where, and what to do.** On a pull request the verdict now names the file the count fell in and three ways out: put back what was removed; or, only if what it tested was itself removed on purpose, end a commit message with `Promptwheel-Allow: test_count: <what was removed, and who asked for it>` (where the contract takes a reason from a commit); or, if neither can be done honestly, stop, leave it red and say why. A reason is read from every commit of the change. A session keeps its own words.
+- **Measured before it was written this way** (1,737 agent runs on Claude Sonnet, Haiku and Opus 5.5 and Fable 5.2, in made-up repos). With the words before, on a test that could not pass, 92 of 100 runs got to green by rewriting the test's expected value. With these, 23 of 100 did, and 77 stopped and handed it to a person. A false reason copied from an earlier commit passed in 5 of 100 runs with a first wording, and in 0 of 100 with this one.
+- **A change cannot write or loosen its own budget.** The budget is part of how a guard is judged, and a guard is judged as it stood at the base. A gate with no budget keeps the fingerprint it had.
+- **Not built:** RRSI's second rule, for a change whose gain is inside the noise. **Not run:** this rule inside RRSI's own loop.
+
 ## 0.8.13 (2026-11-16): a test removed on purpose takes a reason
 
 `CONTRACT.md` has always named "an obsolete test removed" as a change a person can declare. With the default contract it could not be: `init` guards the count of tests, of skipped tests and of assertions, no reason reached those three, and a person who removed a test they no longer wanted failed the check whatever they declared (found by typing it on 2026-11-16, in Sawbuck's proof-bench/yes-counts). A failing test deleted on purpose read `fail` for the count even after `--allow` had taken the gamed green.

@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { extract, evaluate, median, spread, renderMarkdown, isNonSource, evaluatorMatcher, gain, judgeGaming, verdictFingerprint,
-  allowFromComments, check, verdictExitCode, conformsToContract, VERDICTS, METRIC_STATUSES, DIRECTIONS, CONTRACT_VERSION, deriveVerdict } from '../bin/promptwheel.mjs';
+  allowFromComments, check, verdictExitCode, conformsToContract, VERDICTS, METRIC_STATUSES, DIRECTIONS, CONTRACT_VERSION, deriveVerdict, applyBudgets } from '../bin/promptwheel.mjs';
 import { createHash } from 'node:crypto';
 import { realpathSync, chmodSync } from 'node:fs';
 
@@ -31,6 +31,63 @@ test('extract: null when no number', () => assert.equal(extract('nothing here', 
 test('median: odd and even', () => { assert.equal(median([3, 1, 2]), 2); assert.equal(median([1, 2, 3, 4]), 2.5); });
 test('median: empty → null', () => assert.equal(median([]), null));
 test('spread: max - min', () => { assert.equal(spread([5, 2, 9]), 7); assert.equal(spread([]), 0); });
+
+// ------------------------------------------------- unit: a cost paid for by a gain (`budget`, 0.8.14)
+// A guard is a wall. A loop that runs with no person needs a rate too: this much gain buys this much cost, no more.
+const bScore = (delta, over = {}) => ({ name: 'score', direction: 'up', guard: true, before: 0.8, after: +(0.8 + delta).toFixed(4), delta, status: delta > 0 ? 'improved' : 'unchanged', ok: true, ...over });
+const bTokens = (before, after) => ({ name: 'tokens', direction: 'down', guard: true, before, after, delta: after - before, status: after > before ? 'regressed' : 'unchanged', ok: !(after > before) });
+const bDefs = [{ name: 'score', direction: 'up', guard: true }, { name: 'tokens', direction: 'down', guard: true, budget: { gain: 'score', base: 0.10, rate: 44.5 } }];
+test('budget: a cost that rose within base + rate x gain is paid for, and says by what', () => {
+  const [, t] = applyBudgets([bScore(0.02), bTokens(100, 140)], bDefs);   // +40% against 0.10 + 44.5 * 0.02 = 99%
+  assert.equal(t.ok, true); assert.equal(t.status, 'regressed'); assert.deepEqual(t.paid, { gain: 'score', share: 0.4, allowed: 0.99 });
+  assert.equal(deriveVerdict([bScore(0.02), t]), 'pass');
+});
+test('budget: over the budget stays a failure and says by how much', () => {
+  const [, t] = applyBudgets([bScore(0.02), bTokens(100, 300)], bDefs);   // +200% against 99%
+  assert.equal(t.ok, false); assert.deepEqual(t.overBudget, { gain: 'score', share: 2, allowed: 0.99 }); assert.equal(t.paid, undefined);
+  assert.equal(deriveVerdict([bScore(0.02), t]), 'fail');
+});
+test('budget: with no trusted gain the wall stands, whatever the base', () => {
+  for (const s of [bScore(0), bScore(0.02, { status: 'inconclusive' })]) { const [, t] = applyBudgets([s, bTokens(100, 101)], bDefs); assert.equal(t.ok, false); assert.equal(t.paid, undefined); }
+});
+test('budget: a gain that was gamed, or could not be proved, pays for nothing', () => {
+  for (const over of [{ gamed: true }, { unprovable: true }]) { const [, t] = applyBudgets([bScore(0.02, over), bTokens(100, 140)], bDefs); assert.equal(t.ok, false); assert.equal(t.paid, undefined); }
+});
+test('budget: a cost that started at zero has no share to measure, an unknown gain is inert, and a metric with no budget is untouched', () => {
+  assert.equal(applyBudgets([bScore(0.02), bTokens(0, 40)], bDefs)[1].ok, false);
+  assert.equal(applyBudgets([bScore(0.02), bTokens(100, 140)], [bDefs[0], { ...bDefs[1], budget: { gain: 'nope', base: 9, rate: 9 } }])[1].ok, false);
+  assert.equal(applyBudgets([bScore(0.02), bTokens(100, 140)], [bDefs[0], { name: 'tokens', direction: 'down', guard: true }])[1].ok, false);
+  assert.equal(applyBudgets([bScore(0.02), bTokens(100, 90)], bDefs)[1].paid, undefined, 'a cost that fell needs no paying');
+});
+// the whole engine on a small repo: the score and the cost both come from source files, so the win is earned in the source
+function budgetRepo() {
+  const d = mkdtempSync(join(TMP_ROOT, 'budget-')); const g = (...a) => execFileSync('git', a, { cwd: d, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_AUTHOR_NAME: 'a', GIT_AUTHOR_EMAIL: 'a@b.c', GIT_COMMITTER_NAME: 'a', GIT_COMMITTER_EMAIL: 'a@b.c' } });
+  // the commands name the measure (measure.js, which no change here edits); the numbers live in a source file, as a real score lives in the code
+  mkdirSync(join(d, 'src')); const put = (score, tokens) => writeFileSync(join(d, 'src/values.js'), `module.exports = { score: ${score}, tokens: ${tokens} }\n`);
+  writeFileSync(join(d, 'measure.js'), "console.log(require('./src/values.js')[process.argv[2]])\n");
+  const cfg = (budget) => writeFileSync(join(d, 'promptwheel.config.json'), JSON.stringify({ metrics: [
+    { name: 'score', cmd: 'node measure.js score', extract: 'number', direction: 'up', guard: true },
+    { name: 'tokens', cmd: 'node measure.js tokens', extract: 'number', direction: 'down', guard: true, ...(budget ? { budget } : {}) }] }, null, 2));
+  put(80, 100); cfg({ gain: 'score', base: 0.10, rate: 0.2 }); g('init', '-q'); g('add', '-A'); g('commit', '-qm', 'base');
+  const run = () => { const r = spawnSync(process.execPath, [ENGINE, 'run', '--base', 'HEAD~1', '--head', 'HEAD', '--json'], { cwd: d, encoding: 'utf8' }); let j = null; try { j = JSON.parse(r.stdout); } catch {} return { code: r.status, j }; };
+  return { d, g, put, cfg, run };
+}
+test('budget, end to end: a gain of 2 with rate 0.2 buys a cost rise of up to 50%; 40% passes and names what paid, 80% fails', () => {
+  const a = budgetRepo(); a.put(82, 140); a.g('commit', '-qam', 'better and dearer');
+  const ok = a.run(); assert.equal(ok.code, 0, JSON.stringify(ok.j && ok.j.metrics)); assert.equal(ok.j.verdict, 'pass');
+  const t = ok.j.metrics.find((x) => x.name === 'tokens'); assert.equal(t.status, 'regressed'); assert.equal(t.ok, true); assert.equal(t.paid.gain, 'score'); assert.equal(conformsToContract(ok.j).ok, true);
+  const b = budgetRepo(); b.put(82, 180); b.g('commit', '-qam', 'better and far dearer');
+  const no = b.run(); assert.equal(no.code, 1); assert.equal(no.j.verdict, 'fail'); assert.ok(no.j.metrics.find((x) => x.name === 'tokens').overBudget);
+});
+test('budget, end to end: a change cannot write itself a budget (the gate as it was at the base decides)', () => {
+  const a = budgetRepo(); a.cfg(null); a.g('commit', '-qam', 'no budget yet');
+  a.put(82, 140); a.cfg({ gain: 'score', base: 5, rate: 5 }); a.g('commit', '-qam', 'dearer, with a budget written in the same change');
+  const r = a.run(); assert.notEqual(r.code, 0, 'a budget added in the change that needs it does not let it through'); assert.notEqual(r.j.verdict, 'pass');
+});
+test('budget, end to end: a change cannot loosen the budget it runs under (a budget is part of the guard)', () => {
+  const a = budgetRepo(); a.put(82, 400); a.cfg({ gain: 'score', base: 5, rate: 5 }); a.g('commit', '-qam', 'four times the cost, and a looser budget in the same change');
+  const r = a.run(); assert.notEqual(r.code, 0); assert.notEqual(r.j.verdict, 'pass', 'judged by the budget as it was at the base: 300% against 50%');
+});
 
 // -------------------------------------------------------------- unit: evaluate
 const m = (over = {}) => ({ direction: 'down', guard: true, extract: 'number', ...over });
@@ -2961,6 +3018,119 @@ test('init: every counting tripwire leaves out the tool\'s own .promptwheel fold
   mkdirSync(join(d, '.promptwheel/packs/x'), { recursive: true });
   writeFileSync(join(d, '.promptwheel/packs/x/scan.mjs'), "test('t', () => {}); it('i', () => {}); describe('d', () => {}); it.skip('s'); expect(1); assert(1) // eslint-disable\n");
   assert.deepEqual(names.map(count), was);
+  rmSync(d, { recursive: true, force: true });
+});
+
+// ---- found by replaying the contract on 408 real pull requests (proof-bench/outside-repos, 2026-11-18): a docs-only
+// change was sent back for "fewer tests" (the words "it (" in a sentence), a removed dependency for "fewer assertions"
+// (the word assert in yarn.lock), and zod's .describe( and a regex's .test( were counted as tests
+const tripwires = (files) => {
+  const d = mkdtempSync(join(tmpdir(), 'pw-tripwire-'));
+  execFileSync('git', ['init', '-q'], { cwd: d });
+  writeFileSync(join(d, 'package.json'), JSON.stringify({ name: 'x', scripts: { test: 'node --test' } }));
+  mkdirSync(join(d, 'test')); writeFileSync(join(d, 'test/a.test.js'), "test('a', () => { expect(1) })\n");
+  assert.equal(pw(d, ['init', '--no-agent-block']).code, 0);
+  const cfg = JSON.parse(readFileSync(join(d, 'promptwheel.config.json'), 'utf8'));
+  const names = ['test_count', 'skipped_tests', 'suppressions', 'assertions'];
+  const counts = () => names.map((name) => +execFileSync('sh', ['-c', cfg.metrics.find((m) => m.name === name).cmd], { cwd: d, encoding: 'utf8' }).trim());
+  const was = counts();
+  for (const [f, text] of Object.entries(files)) { mkdirSync(dirname(join(d, f)), { recursive: true }); writeFileSync(join(d, f), text); }
+  const now = counts();
+  rmSync(d, { recursive: true, force: true });
+  return now.map((n, i) => n - was[i]);   // [tests, skipped, silenced, assertions] added by the files
+};
+test('init: the counting tripwires read code, not prose, lock files or data', () => {
+  assert.deepEqual(tripwires({
+    'docs/notes.md': "We ran it (twice) and test (the build) again. expect (nothing) here; assert that it('x') holds. // eslint-disable\n",
+    'README.rst': "describe (the thing) and test('it')\n",
+    'yarn.lock': '"assert@npm:^2.0.0":\n  version: 2.1.0\n  resolution: "assert@npm:2.1.0"\n',
+    'package-lock.json': '{"packages":{"node_modules/assert":{"version":"2.1.0"},"node_modules/expect":{}}}\n',
+    'locales/en.yml': 'hint: "press it (twice) to test (again), then assert"\n',
+    'data/notes.json': '{"note":"expect (this): it (works)"}\n',
+  }), [0, 0, 0, 0]);
+});
+test('init: a member call is not a test; a tap, Deno or QUnit test is', () => {
+  assert.deepEqual(tripwires({
+    'src/schema.js': "export const s = z.string().describe('a name');\nexport const ok = (v) => /^a/.test(v);\npage.it(1); suite.describe('x');\n",
+  }), [0, 0, 0, 0], 'zod .describe( and a regex .test( are not tests');
+  assert.deepEqual(tripwires({
+    'test/more.test.js': "t.test('sub', (t) => { t.equal(1, 1); t.end() })\nDeno.test('d', () => {})\nQUnit.test('q', () => {})\ndescribe('g', () => { it('i', () => {}); test('t', () => {}) })\nit.skip('s', () => {}); xtest('x', () => {})\n",
+  }), [6, 2, 0, 1], 'three member-call tests the frameworks define, a group, two tests; two skipped; one tap assertion');
+});
+test('init: the counting tripwires read Go, Rust, Ruby, Java, C#, Elixir, Swift and Python tests', () => {
+  const each = {
+    go: [{ 'add_test.go': 'func TestAdd(t *testing.T) {\n\tif add(1, 2) != 3 {\n\t\tt.Errorf("no")\n\t}\n}\nfunc (s *Suite) TestSub() { require.Equal(s.T(), 1, 1) }\nfunc TestLater(t *testing.T) { t.Skip("later") }\nfunc testHelper() {}\n' }, [3, 1, 0, 2]],
+    rust: [{ 'src/lib.rs': '#[cfg(test)]\nmod tests {\n    #[test]\n    fn adds() { assert_eq!(1 + 1, 2); }\n    #[tokio::test]\n    async fn waits() { assert!(true); }\n    #[test]\n    #[ignore]\n    fn later() {}\n}\n' }, [3, 1, 0, 2]],
+    ruby: [{ 'spec/a_spec.rb': "describe 'A' do\n  it 'adds' do\n    expect(1 + 1).to eq 2\n  end\n  xit 'later' do\n  end\n  it { is_expected.to be_nil }\nend\n" }, [2, 1, 0, 1]],
+    java: [{ 'src/test/java/ATest.java': 'class ATest {\n  @Test\n  void adds() { assertEquals(2, 1 + 1); }\n  @Test\n  @Disabled\n  void later() {}\n}\n' }, [2, 1, 0, 1]],
+    csharp: [{ 'tests/ATests.cs': 'public class ATests {\n  [Fact]\n  public void Adds() { Assert.Equal(2, 1 + 1); }\n  [Fact(Skip = "later")]\n  public void Later() {}\n  [Theory]\n  public void Many(int a) { Assert.True(a > 0); }\n}\n' }, [3, 1, 0, 2]],
+    elixir: [{ 'test/a_test.exs': 'test "adds" do\n  assert 1 + 1 == 2\nend\n' }, [1, 0, 0, 1]],
+    swift: [{ 'Tests/ATests.swift': '@Test func adds() { #expect(1 + 1 == 2) }\nfunc old() { XCTAssertEqual(1, 1) }\n' }, [1, 0, 0, 2]],
+    python: [{ 'tests/test_a.py': 'import pytest\n\ndef test_adds():\n    assert 1 + 1 == 2\n\n@pytest.mark.xfail\ndef test_later():\n    assert False\n' }, [2, 1, 0, 2]],
+  };
+  for (const [lang, [files, want]] of Object.entries(each)) assert.deepEqual(tripwires(files), want, `${lang}: [tests, skipped, silenced, assertions]`);
+});
+
+// ---- the verdict for whoever repairs it, a person or a fix run. Found by reading how agent pipelines are built
+// (proof-bench/outside-repos, section 8): most merged agent pull requests carry no word from a person, and a reject
+// that names its cause is what a fix run acts on. Until now a fall in tests said neither where nor what to do.
+const fallRepo = (allowable) => {
+  const d = mkdtempSync(join(tmpdir(), 'pw-fall-'));
+  for (const a of [['init', '-q'], ['config', 'user.name', 't'], ['config', 'user.email', 't@t'], ['config', 'commit.gpgsign', 'false']]) execFileSync('git', a, { cwd: d });
+  writeFileSync(join(d, 'package.json'), JSON.stringify({ name: 'x', scripts: { test: 'node --test' } }));
+  mkdirSync(join(d, 'test'));
+  writeFileSync(join(d, 'test/a.test.js'), "const t = require('node:test');\nt.test('add', () => {});\nt.test('sub', () => {});\n");
+  writeFileSync(join(d, 'test/b.test.js'), "const t = require('node:test');\nt.test('mul', () => {});\n");
+  assert.equal(pw(d, ['init', '--no-agent-block']).code, 0);
+  const f = join(d, 'promptwheel.config.json'); const c = JSON.parse(readFileSync(f, 'utf8'));
+  c.metrics = c.metrics.filter((m) => ['test_count', 'skipped_tests', 'assertions'].includes(m.name)).map((m) => ({ ...m, allowable }));
+  writeFileSync(f, JSON.stringify(c, null, 2)); commitAll(d, 'the contract');
+  return d;
+};
+const ONE_TEST = "const t = require('node:test');\nt.test('add', () => {});\n";
+test('run: a fall in a counting tripwire says which file, and the two ways out', () => {
+  let d = fallRepo('flag');
+  writeFileSync(join(d, 'test/a.test.js'), ONE_TEST); commitAll(d, 'drop the sub test');
+  const r = runJson(d);
+  assert.equal(r.code, 1);
+  assert.deepEqual(r.rep.metrics.find((x) => x.name === 'test_count').where, [{ file: 'test/a.test.js', before: 2, after: 1 }]);
+  assert.equal(r.rep.byCommit, undefined, 'this contract takes no reason from a commit');
+  let out = pw(d, ['run', '--base', 'HEAD~1', '--head', 'HEAD', '--no-record']).out;
+  assert.match(out, /fewer tests: 3 → 2, in test\/a\.test\.js \(2 → 1\)/);
+  assert.match(out, /1\. put back what was removed, and push/);
+  assert.match(out, /2\. if removing it is the job, a person gives the reason: promptwheel run --allow "<reason>"/);
+  assert.doesNotMatch(out, /Promptwheel-Allow: test_count/);
+  let md = pw(d, ['run', '--base', 'HEAD~1', '--head', 'HEAD', '--no-record', '--markdown']).out;
+  assert.match(md, /\*\*Where:\*\* `test\/a\.test\.js` \(2 → 1\)/); assert.match(md, /Put back what was removed, and push/);
+  assert.match(md, /someone with write access who did not open this PR comments `sawbuck-allow: <their reason>`/);
+  rmSync(d, { recursive: true, force: true });
+  d = fallRepo(true);
+  writeFileSync(join(d, 'test/a.test.js'), ONE_TEST); commitAll(d, 'drop the sub test');
+  assert.deepEqual(runJson(d).rep.byCommit, ['test_count']);
+  out = pw(d, ['run', '--base', 'HEAD~1', '--head', 'HEAD', '--no-record']).out;
+  assert.match(out, /2\. only if what it tested was itself removed on purpose, end a commit message in this change with the line\n\s+Promptwheel-Allow: test_count: <what was removed, and who asked for it>/);
+  assert.match(out, /a test that fails on the new code is not a reason to remove it/);
+  assert.match(out, /3\. if neither can be done honestly, stop: leave the pull request red and say why/);
+  md = pw(d, ['run', '--base', 'HEAD~1', '--head', 'HEAD', '--no-record', '--markdown']).out;
+  assert.match(md, /`Promptwheel-Allow: test_count: <what was removed, and who asked for it>`/); assert.doesNotMatch(md, /sawbuck-allow: <their reason>/);
+  rmSync(d, { recursive: true, force: true });
+});
+test('run: where the contract takes a reason from a commit, any commit of the change may carry it', () => {
+  const twoCommits = (d) => {
+    writeFileSync(join(d, 'test/a.test.js'), ONE_TEST);
+    execFileSync('git', ['commit', '-qam', 'drop the sub test\n\nPromptwheel-Allow: test_count: the rule it checked went'], { cwd: d });
+    writeFileSync(join(d, 'notes.txt'), 'later\n'); commitAll(d, 'a later commit that says nothing');
+    const r = spawnSync('node', [ENGINE, 'run', '--base', 'HEAD~2', '--head', 'HEAD', '--json', '--no-record'], { cwd: d, encoding: 'utf8' });
+    return { code: r.status, rep: JSON.parse(r.stdout) };
+  };
+  let d = fallRepo(true);
+  let r = twoCommits(d);
+  assert.equal(r.code, 0, JSON.stringify(r.rep.allowed));
+  assert.ok(r.rep.allowed.cleared.includes('test_count')); assert.match(r.rep.allowed.reason, /the rule it checked went/);
+  rmSync(d, { recursive: true, force: true });
+  d = fallRepo('flag');
+  r = twoCommits(d);
+  assert.equal(r.code, 1, 'a contract that asks a person takes no reason from any commit');
   rmSync(d, { recursive: true, force: true });
 });
 

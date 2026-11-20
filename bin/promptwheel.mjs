@@ -831,7 +831,9 @@ const PLACEHOLDER_TEST = 'echo "set your test command in promptwheel.config.json
 // `report`: true = its regression is a note; 'no-win' = a note only when the change won nothing (see winsNothing); else a guard
 const reportMode = (m) => (m.report === true ? true : m.report === 'no-win' ? 'no-win' : false);
 const winsNothing = (evaluated) => !evaluated.some((x) => x.status === 'improved' && !x.tripwire);   // a tripwire going up is not a win
-const measuredBy = (m) => JSON.stringify([m.cmd ?? null, m.extract ?? 'number', m.direction || 'up', m.exact === true, reportMode(m)]);
+// a budget is part of how a guard is judged; it is added to the signature only where there is one, so a gate with none keeps the fingerprint it had
+const budgetSig = (m) => (m.budget && typeof m.budget === 'object' ? [[m.budget.gain ?? null, Number(m.budget.base) || 0, Number(m.budget.rate) || 0]] : []);
+const measuredBy = (m) => JSON.stringify([m.cmd ?? null, m.extract ?? 'number', m.direction || 'up', m.exact === true, reportMode(m), ...budgetSig(m)]);
 // an order-independent SHA-256 (truncated) fingerprint of a gate definition, for the audit record
 function gateFingerprint(metricsList, scalars) {
   const norm = {
@@ -920,11 +922,36 @@ const TEST_KIND = new Set(['tests_pass', 'test_count', 'skipped_tests', 'asserti
 const kindOf = (label) => (TEST_KIND.has(label) ? 'the tests' : label);
 const kindsIn = (labels) => new Set([...labels].map(kindOf)).size;
 const reasonNames = (reason, label) => new RegExp(`(^|[^A-Za-z0-9_-])${label.replace(/^mandate:/, '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}($|[^A-Za-z0-9_-])`, 'i').test(reason);
-function readAllowTrailer(repo, ref) {
-  let msg = '';
-  try { msg = execFileSync('git', ['log', '-1', '--no-show-signature', '--format=%B', ref], { cwd: repo, encoding: 'utf8' }); } catch { return null; }
-  const m = msg.match(/^[ \t]*(?:Promptwheel-Allow|Sawbuck-Allow)[ \t]*:[ \t]*(\S.*?)[ \t]*$/im);
-  return m && m[1].trim() ? { reason: m[1].trim().slice(0, 300) } : null;
+// A reason written in a commit. Every commit of the change is read (base..head), not the last one alone: a fix run
+// that adds a commit must not lose the reason an earlier commit of the same change gave. With no base, the head commit.
+function readAllowTrailer(repo, ref, base) {
+  const log = (args) => { try { return execFileSync('git', ['log', '--no-show-signature', '--format=%B', ...args], { cwd: repo, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }); } catch { return ''; } };
+  const msg = (base && log([`${base}..${ref}`])) || log(['-1', ref]);
+  const found = [...msg.matchAll(/^[ \t]*(?:Promptwheel-Allow|Sawbuck-Allow)[ \t]*:[ \t]*(\S.*?)[ \t]*$/gim)].map((m) => m[1].trim()).filter(Boolean);
+  return found.length ? { reason: [...new Set(found)].join(' | ').slice(0, 300) } : null;
+}
+
+// Which files a fallen count fell in, for whoever repairs it. Only for the tripwires `init` writes (a grep that prints
+// every match, counted): the same grep, counted by file, at both refs. Refs mode only: it checks out two commits.
+const TRIP_TAIL = /\|\s*wc -l\s*\|\s*tr -d " "\s*$/;
+function tripwireWhere(repo, base, head, def) {
+  if (!def || typeof def.cmd !== 'string' || !/^grep -rIoE /.test(def.cmd) || !TRIP_TAIL.test(def.cmd)) return null;
+  const byFile = def.cmd.replace(TRIP_TAIL, '| cut -d: -f1 | sort | uniq -c');
+  const at = (ref) => {
+    const wt = mkdtempSync(join(tmpBase(repo), tmpPrefix(repo, 'promptwheel')));
+    try {
+      addWorktree(repo, wt, ref);
+      const out = execSync(byFile, { cwd: wt, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 64 * 1024 * 1024, timeout: 120000 });
+      return Object.fromEntries(out.split('\n').map((l) => l.match(/^\s*(\d+)\s+(.+)$/)).filter(Boolean).map((x) => [x[2].replace(/^\.\//, ''), +x[1]]));
+    } catch { return null; } finally { try { git(['worktree', 'remove', '--force', wt], repo); } catch { rmSync(wt, { recursive: true, force: true }); } }
+  };
+  const b = at(base), a = at(head);
+  if (!b || !a) return null;
+  const down = def.direction === 'down';
+  const worse = [...new Set([...Object.keys(b), ...Object.keys(a)])].map((file) => ({ file, before: b[file] || 0, after: a[file] || 0 }))
+    .filter((x) => (down ? x.after > x.before : x.after < x.before))
+    .sort((x, y) => Math.abs(y.after - y.before) - Math.abs(x.after - x.before) || (x.file < y.file ? -1 : 1));
+  return worse.length ? worse.slice(0, 5) : null;
 }
 
 // A change is judged by the gate that was in force before it (`baseGate`: the config at base, or the
@@ -1062,6 +1089,25 @@ function detectGamingPass(repo, base, head, cfg, metrics, repeat, baseGate) {
 // elsewhere (a loop reading the verdict would throw away a good change). And a
 // win whose source-only re-run could not be applied (`unprovable`) is never a PASS either: a green
 // the engine could not re-prove is exactly the green it exists to doubt.
+// A COST PAID FOR BY A GAIN (0.8.14). A guard is a wall: the metric may not get worse. A loop that runs with no person
+// needs a rate as well: this much gain on X buys this much cost on Y, and no more. On a guarded metric,
+// `"budget": { "gain": "<metric>", "base": b, "rate": r }` lets a trusted regression through when the named metric has
+// a trusted improvement d that the source earned, and the regression's share of its old value is at most
+// b + r * |d|. With no such gain the wall stands as before. The rule is the cost rule of Google's RRSI (arXiv
+// 2609.24972, Eq. 7: delta C <= beta0 + beta1 * delta S), where an unregularized loop paid 2.4 times the tokens for
+// nothing. Pure arithmetic over the measured results; run after the gaming pass, so a gamed gain pays for nothing.
+export function applyBudgets(metrics, defs) {
+  for (const x of metrics) {
+    const def = (defs || []).find((c) => c && c.name === x.name); const b = def && def.budget;
+    if (!b || typeof b !== 'object' || !x.guard || x.status !== 'regressed' || x.ok) continue;
+    const g = metrics.find((y) => y.name === b.gain); const base = Number(b.base) || 0, rate = Number(b.rate) || 0;
+    if (!g || g.status !== 'improved' || g.gamed === true || g.unprovable === true || base < 0 || rate < 0 || !(Math.abs(x.before) > 0)) continue;
+    const note = { gain: g.name, share: +(Math.abs(x.after - x.before) / Math.abs(x.before)).toFixed(6), allowed: +(base + rate * Math.abs(g.delta)).toFixed(6) };
+    if (note.share <= note.allowed) { x.ok = true; x.paid = note; } else x.overBudget = note;
+  }
+  return metrics;
+}
+
 export function deriveVerdict(metrics, gateInfo = null, mandated = false) {
   const failed = metrics.some((m) => m.guard && !m.ok);
   const gamed = metrics.some((m) => m.gamed === true) || !!(gateInfo && gateInfo.weakened && !gateInfo.allowed);
@@ -1126,6 +1172,7 @@ function gate(repo, opts) {
   }
   // Section 3 (gaming detection), on by default: mutates `metrics` and yields the gate record
   const gateInfo = opts.detectGaming ? detectGamingPass(repo, base, head, cfg, metrics, repeat, baseGate) : null;
+  applyBudgets(metrics, cfg.metrics);   // after the gaming pass: a gain the source did not earn pays for nothing
   // declared override: a Promptwheel-Allow trailer (or --allow) acknowledges an intentional
   // goalpost/gate change, so a would-be GAMED becomes PASS, recorded in report.allowed for review.
   // It covers an `unprovable` win too (the source-only re-run could not be applied): the declared
@@ -1136,7 +1183,7 @@ function gate(repo, opts) {
   // commit message, so where the threat is the agent itself only the --allow flag counts. The base
   // ref's contract is read too, so an agent cannot turn trailers back on in the change it is making.
   const trailersOff = () => !!process.env.PROMPTWHEEL_NO_ALLOW_TRAILER || cfg.allowTrailer === false || ((gateDefAtRef(repo, base) || {}).scalars || {}).allowTrailer === false;
-  const allow = opts.allow ? { reason: String(opts.allow).slice(0, 300), by: 'flag' } : (opts.working || trailersOff() ? null : readAllowTrailer(repo, head));
+  const allow = opts.allow ? { reason: String(opts.allow).slice(0, 300), by: 'flag' } : (opts.working || trailersOff() ? null : readAllowTrailer(repo, head, base));
   // mandates: a protected-path hard rule fails the gate no matter what the metrics say.
   // The base ref's mandates count too (resolved through `extends` by gateDefAtRef), so a change
   // cannot clear a mandate by deleting it in the same diff that violates it.
@@ -1178,6 +1225,9 @@ function gate(repo, opts) {
     if (reach.size) allowed = { reason: allow.reason, cleared: [...cleared] };
   }
   for (const m of guards) if (!m.allowed) m.allowable = true;   // failed, and a declared reason would clear it: say so in the report
+  // for whoever repairs it, a person or a fix run: which files a fallen count fell in, and whether a reason in a commit is taken
+  if (!opts.working) for (const m of guards) if (!m.allowed && m.status === 'regressed') { const w = tripwireWhere(repo, base, head, (cfg.metrics || []).find((c) => c && c.name === m.name)); if (w) m.where = w; }
+  const byCommit = opts.working || trailersOff() ? [] : guards.filter((m) => !m.allowed && mode.get(m.name) === true).map((m) => m.name);
   const mandated = mandateViolations.length > 0;
   const verdict = deriveVerdict(metrics, gateInfo, mandated);
   // what was measured in words, and one thing no diff shows: a variable in this environment that can change which
@@ -1192,6 +1242,8 @@ function gate(repo, opts) {
     ...(gateInfo ? { gate: gateInfo } : {}),
     ...(allowed ? { allowed } : {}),
     ...(allowable.length ? { allowable } : {}),
+    ...(byCommit.length ? { byCommit } : {}),
+    ...(Array.isArray(cfg.mandates) && cfg.mandates.length ? { protects: cfg.mandates.length } : {}),
   };
   // a setup command that failed, at the ref it failed at: the usual reason a metric could not be measured
   const sb = setupFails.get(before), sa = setupFails.get(after);
@@ -1226,18 +1278,36 @@ function run(argv) {
 // init, write a starter config so a newcomer isn't staring at a blank page
 // ---------------------------------------------------------------------------
 const LINT_CMD = 'npx eslint . -f unix 2>/dev/null | grep -c " error " || true';
+// The counting tripwires. They read CODE files only, and they read more than JavaScript and Python. Both came out of
+// replaying the contract on 408 real pull requests (proof-bench/outside-repos, 2026-11-18): a docs-only change was sent
+// back for "fewer tests" (the words "it (" in a sentence of a Markdown file), a removed dependency for "fewer assertions"
+// (the word assert in yarn.lock), zod's .describe( and a regex's .test( were counted as tests, and a Go, Rust or Ruby
+// repo had no test the counts could see. A contract signed before this keeps the commands it was signed with.
+const CODE_FILES = ['js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs', 'mts', 'cts', 'vue', 'svelte', 'py', 'go', 'rs', 'rb', 'java', 'kt', 'cs', 'swift', 'ex', 'exs'].map((e) => `--include="*.${e}"`).join(' ');
+const SKIP_DIRS = '--exclude-dir=node_modules --exclude-dir=.promptwheel --exclude-dir=.git --exclude-dir=dist --exclude-dir=build --exclude-dir=coverage --exclude-dir=.next --exclude-dir=out --exclude-dir=lib-cov --exclude-dir=__pycache__ --exclude-dir=.pytest_cache --exclude-dir=target --exclude-dir=.venv --exclude-dir=venv --exclude=promptwheel.config.json';
+// grep prints each match alone (-o); `drop` takes out the matches that are not what the count means
+const tripwire = (re, drop) => `grep -rIoE "${re}" ${CODE_FILES} ${SKIP_DIRS} . 2>/dev/null${drop ? ` | grep -vE "${drop}"` : ''} | wc -l | tr -d " "`;
+// a test, by language. JavaScript: it( test( describe(, and the member calls the frameworks define (tap's t.test(, Deno.test(,
+// QUnit.test(); any other member call (.describe( on a schema, .test( on a regex) is matched WITH its dot and dropped.
+// Python and minitest: def test_. Go: func TestX( and a suite's method. Rust: #[test] and its kin. RSpec, Rails, Elixir:
+// it "..." and test "...". JUnit and Swift Testing: @Test. C#: [Fact] [Theory] [Test] [TestMethod] [TestCase].
+const TESTS_RE = String.raw`\b(t|Deno|QUnit)\.test ?\(|\.?\b(it|test|describe) ?\(|def test_|func (Test|Fuzz)[[:alnum:]_]*\(|func \([^)]*\) Test[[:alnum:]_]*\(|#\[([[:alnum:]_]+::)*(test|rstest|test_case)\b|\b(it|specify|scenario|test) [\"']|\bit \{|@(Test|ParameterizedTest|RepeatedTest)\b|\[(Fact|Theory|Test|TestMethod|TestCase|DataTestMethod)[](]`;
+const TESTS_DROP = String.raw`:\.(it|test|describe) ?\($`;
+const SKIPS_RE = String.raw`\.(skip|only) ?\(|\bx(it|test|describe) ?\(|@pytest\.mark\.(skip|xfail)|@unittest\.skip|\bt\.Skip(f|Now)?\(|#\[ignore|\bx(it|describe|context|specify) [\"']|@(Disabled|Ignore)\b|Skip ?= ?\"|\[Ignore[](]`;
+const SILENCED_RE = String.raw`eslint-disable|@ts-(ignore|nocheck)|# ?type: ?ignore|# ?noqa|# ?nosec|//nolint|#!?\[allow\(`;
+const ASSERTS_RE = String.raw`expect ?\(|\bassert|\bAssert\.[A-Z]|\bt\.(is|deepEqual|throws|truthy|falsy|not|ok|equal|same|match|notOk|rejects) ?\(|\bt\.(Error|Errorf|Fatal|Fatalf)\(|\brequire\.[A-Z][[:alnum:]]*\(|\bXCTAssert`;
 const PRESETS = {
   'antihack': { desc: 'catch reward-hacking: a target + tripwires; pairs with `run --detect-gaming` (source-only re-run)',
     metrics: [
       { name: 'tests_pass', cmd: '__TESTCMD__', extract: 'exit', direction: 'pass', guard: true },
       // the three counts of the tests themselves take a person's reason by the flag (never a trailer, which an agent can
       // write): a test removed or skipped on purpose is sometimes the job. Until 0.8.13 no reason reached them.
-      { name: 'test_count', cmd: 'grep -rIoE "\\b(it|test|describe) ?\\(|def test_" --exclude-dir=node_modules --exclude-dir=.promptwheel --exclude-dir=.git --exclude-dir=dist --exclude-dir=build --exclude-dir=coverage --exclude-dir=.next --exclude-dir=out --exclude-dir=lib-cov --exclude-dir=__pycache__ --exclude-dir=.pytest_cache --exclude-dir=target --exclude-dir=.venv --exclude-dir=venv --exclude=promptwheel.config.json . 2>/dev/null | wc -l | tr -d " "', extract: 'number', direction: 'up', guard: true, gamingCheck: false, allowable: 'flag' },
-      { name: 'skipped_tests', cmd: 'grep -rIoE "\\.(skip|only) ?\\(|\\bxit ?\\(|@pytest\\.mark\\.skip" --exclude-dir=node_modules --exclude-dir=.promptwheel --exclude-dir=.git --exclude-dir=dist --exclude-dir=build --exclude-dir=coverage --exclude-dir=.next --exclude-dir=out --exclude-dir=lib-cov --exclude-dir=__pycache__ --exclude-dir=.pytest_cache --exclude-dir=target --exclude-dir=.venv --exclude-dir=venv --exclude=promptwheel.config.json . 2>/dev/null | wc -l | tr -d " "', extract: 'number', direction: 'down', guard: true, gamingCheck: false, allowable: 'flag' },
+      { name: 'test_count', cmd: tripwire(TESTS_RE, TESTS_DROP), extract: 'number', direction: 'up', guard: true, gamingCheck: false, allowable: 'flag' },
+      { name: 'skipped_tests', cmd: tripwire(SKIPS_RE), extract: 'number', direction: 'down', guard: true, gamingCheck: false, allowable: 'flag' },
       // a note when the change wins nothing (report: 'no-win'): on 340 real commits a blocking silencer count sent back 13 for a person adding
       // eslint-disable, #[allow] or //nolint in ordinary work, and in none of the 17 where it rose did anything else get better. Beside a win it still fails.
-      { name: 'suppressions', cmd: 'grep -rIoE "eslint-disable|@ts-(ignore|nocheck)|# ?type: ?ignore|# ?noqa|# ?nosec|//nolint|#!?\\[allow\\(" --exclude-dir=node_modules --exclude-dir=.promptwheel --exclude-dir=.git --exclude-dir=dist --exclude-dir=build --exclude-dir=coverage --exclude-dir=.next --exclude-dir=out --exclude-dir=lib-cov --exclude-dir=__pycache__ --exclude-dir=.pytest_cache --exclude-dir=target --exclude-dir=.venv --exclude-dir=venv --exclude=promptwheel.config.json . 2>/dev/null | wc -l | tr -d " "', extract: 'number', direction: 'down', guard: true, report: 'no-win', gamingCheck: false },
-      { name: 'assertions', cmd: 'grep -rIoE "expect ?\\(|\\bassert|\\bt\\.(is|deepEqual|throws|truthy|falsy|not|ok) ?\\(" --exclude-dir=node_modules --exclude-dir=.promptwheel --exclude-dir=.git --exclude-dir=dist --exclude-dir=build --exclude-dir=coverage --exclude-dir=.next --exclude-dir=out --exclude-dir=lib-cov --exclude-dir=__pycache__ --exclude-dir=.pytest_cache --exclude-dir=target --exclude-dir=.venv --exclude-dir=venv --exclude=promptwheel.config.json . 2>/dev/null | wc -l | tr -d " "', extract: 'number', direction: 'up', guard: true, gamingCheck: false, allowable: 'flag' },
+      { name: 'suppressions', cmd: tripwire(SILENCED_RE), extract: 'number', direction: 'down', guard: true, report: 'no-win', gamingCheck: false },
+      { name: 'assertions', cmd: tripwire(ASSERTS_RE), extract: 'number', direction: 'up', guard: true, gamingCheck: false, allowable: 'flag' },
     ] },
   'no-ai-tells': { desc: 'opt-in: fail the gate if the em-dash count rises (an AI writing tell); some projects use them on purpose, so it is not a default',
     metrics: [
@@ -1432,6 +1502,8 @@ function printHuman(r) {
     const tag = m.guard ? (m.ok ? 'guard✓' : 'GUARD✗') : 'info';
     const d = m.delta == null ? 'n/a' : (m.delta > 0 ? `+${m.delta}` : `${m.delta}`);
     console.log(`  ${arrowFor(m)} ${m.name.padEnd(18)} ${String(m.before).padStart(8)} → ${String(m.after).padStart(8)}  (${d}, ${m.status}) [${tag}, ${m.confidence}]`);
+    if (m.paid) console.log(`      ✓ paid for by "${m.paid.gain}": worse by ${(m.paid.share * 100).toFixed(1)}%, and that gain buys up to ${(m.paid.allowed * 100).toFixed(1)}%`);
+    else if (m.overBudget) console.log(`      ✗ over its budget: worse by ${(m.overBudget.share * 100).toFixed(1)}%, and the gain on "${m.overBudget.gain}" buys ${(m.overBudget.allowed * 100).toFixed(1)}%`);
     if (m.inert && m.ran && m.cause === 'missing-dependency') console.log(`      ⚠ "${m.name}" could not run in the clean copy at either ref: ${m.detail}. Link or install what it needs (linkDirs or setup in promptwheel.config.json), then check again`);
     else if (m.inert && m.ran === 'both') console.log(`      ⚠ "${m.name}" ran and failed before and after this change, so it guards nothing here. Fix the failing tests, or the command, before trusting a pass`);
     else if (m.inert) console.log(`      ⚠ "${m.name}" ${m.ran ? `ran and failed at the ${m.ran} ref and did not run at the other` : 'never ran (same value at both refs)'}: its command needs a build/deps first, or is not your real test command. Fix: promptwheel init, or set setup/linkDirs in promptwheel.config.json`);
@@ -1451,7 +1523,12 @@ function printHuman(r) {
     const takes = r.mandates.filter((md) => md.allowable).map((md) => `"${md.name}"`);
     if (takes.length && !left.length) console.log(`  intentional? ${takes.join(', ')} ${takes.length > 1 ? 'accept' : 'accepts'} a person's declared reason: promptwheel run ${how} passes with the reason on the record${each}`);
     if (takes.length < r.mandates.length) console.log(`  ${takes.length ? 'any other' : 'a'} mandate is a hard rule; if the change is truly intended, retire the mandate in promptwheel.config.json in a change of its own first (a tracked, tamper-evident change), do not work around it`);
-  } else if (r.verdict === 'fail' && r.metrics.some((m) => m.allowable) && !left.length) console.log(`  intentional? this guard accepts a person's declared reason: promptwheel run ${how} passes with the reason on the record${each || ` (${r.metrics.filter((m) => m.allowable).map((m) => m.name).join(', ')})`}`);
+  } else if (r.verdict === 'fail' && r.metrics.some((m) => m.allowable) && !left.length) {
+    // a pull request's reader is often a fix run: say where the tests fell and the two ways out. A session keeps its own words.
+    const fell = r.mode === 'refs' ? fallenTests(r) : [];
+    if (fell.length) for (const l of wayOut(r, fell, how)) console.log('  ' + l);
+    else console.log(`  intentional? this guard accepts a person's declared reason: promptwheel run ${how} passes with the reason on the record${each || ` (${r.metrics.filter((m) => m.allowable).map((m) => m.name).join(', ')})`}`);
+  }
   else if (r.verdict === 'fail') console.log('  intentional? loosen that guard locally in promptwheel.config.json (guard:false, or override the inherited metric by name)');
   if (r.allowed && r.allowed.cleared.length) console.log(`  ✓ allowed: ${r.allowed.cleared.join(', ')} acknowledged as an intentional change, recorded (Promptwheel-Allow: ${r.allowed.reason})`);
   if (left.length) console.log(`  not let through: ${left.join(', ')}. A reason lets through only what it names when there is more than one thing. To accept them all: promptwheel run ${how}`);
@@ -1515,6 +1592,44 @@ export function allowDecision(comments, opts = {}) {
 }
 export function allowFromComments(comments, opts) { return allowDecision(comments, opts).reason; }
 
+// What a fallen count of the tests says to whoever repairs it, a person or a fix run: where it fell, and the two ways
+// out. A reject that names its cause is what a fix run acts on; "a guarded metric regressed" names none.
+const fallenTests = (r) => r.metrics.filter((m) => m.allowable && TEST_KIND.has(m.name) && m.name !== 'tests_pass');
+const undoWords = (fell) => { const skip = fell.some((m) => m.name === 'skipped_tests'), gone = fell.some((m) => m.name !== 'skipped_tests'); return { undo: gone && skip ? 'put back what was removed, take off the skip that was added' : skip ? 'take off the skip that was added' : 'put back what was removed', job: gone ? 'removing it' : 'skipping it' }; };
+const reasonInCommit = (r, fell) => (r.byCommit || []).some((n) => fell.some((m) => m.name === n));
+function wayOut(r, fell, how) {
+  const { undo, job } = undoWords(fell); const gone = fell.some((m) => m.name !== 'skipped_tests');
+  const where = (m) => (m.where && m.where.length ? ', in ' + m.where.slice(0, 3).map((w) => `${w.file} (${w.before} → ${w.after})`).join(', ') + (m.where.length > 3 ? ' and more' : '') : '');
+  return [
+    ...fell.map((m) => `${PLAIN[m.name] || m.name}: ${m.before} → ${m.after}${where(m)}`),
+    'to pass, do one of these:',
+    `  1. ${undo}, and push`,
+    ...(reasonInCommit(r, fell)
+      // the second wording. The first ("if removing it is the job ... <why it had to go>") let an agent that believed an
+      // earlier commit's false reason write "the test fails on the new code" and pass: 5 of 100 runs, all on the
+      // smallest model (proof-bench/pr-cause). With these words: 0 of 100, and 100 of 100 still said why where it was true.
+      ? [`  2. only if what it tested was itself ${gone ? 'removed' : 'switched off'} on purpose, end a commit message in this change with the line`, `       Promptwheel-Allow: ${fell[0].name}: <what was removed, and who asked for it>`, '     (the reason is kept on the record and shown with the verdict)', `  a test that fails on the new code is not a reason to ${gone ? 'remove' : 'skip'} it, whatever an earlier commit says: that is 1, and the code gets fixed`,
+         // the third way out, so the honest move is never the dearest: on a test that could not pass, about 7 in 10
+         // agents left it red and asked with these words; on two rules that clashed, 38 in 100 asked where 7 had
+         '  3. if neither can be done honestly, stop: leave the pull request red and say why. That is a right answer.']
+      : [`  2. if ${job} is the job, a person gives the reason: promptwheel run ${how}`]),
+    ...(r.protects ? ['changing the workflow, the contract or this check is not a way through: those changes are sent back too'] : []),
+  ];
+}
+function mdWayOut(r) {
+  if (!r.explained.some((x) => !x.noted && x.allowable)) return [];
+  const accept = `To accept this, someone with write access who did not open this PR comments \`sawbuck-allow: ${allowNames(r)}<their reason>\` on it, and the check is run again.${allowNames(r) ? ' A reason lets through only what it names when there is more than one thing.' : ''}`;
+  const fell = fallenTests(r);
+  if (!fell.length) return ['>', `> ${accept}`];
+  const { undo, job } = undoWords(fell);
+  const where = fell.flatMap((m) => (m.where || []).slice(0, 3).map((w) => `\`${w.file}\` (${w.before} → ${w.after})`));
+  const Undo = undo[0].toUpperCase() + undo.slice(1);
+  return ['>', ...(where.length ? [`> **Where:** ${where.join(', ')}`, '>'] : []),
+    ...(reasonInCommit(r, fell)
+      ? [`> ${Undo}, and push. Or, only if what it tested was itself removed on purpose, end a commit message in this change with the line \`Promptwheel-Allow: ${fell[0].name}: <what was removed, and who asked for it>\`. The reason is kept on the record and shown here.`, '>', '> A test that fails on the new code is not a reason to remove it, whatever an earlier commit says: the code gets fixed.', '>', '> If neither can be done honestly, stop: leave the pull request red and say why. That is a right answer.']
+      : [`> ${Undo}, and push. Or, if ${job} is the job:`, '>', `> ${accept}`]),
+    ...(r.protects ? ['>', '> Changing the workflow, the contract or this check is not a way through: those changes are sent back too.'] : [])];
+}
 function renderMarkdown(r) {
   const icon = r.verdict === 'pass' ? '✅' : r.verdict === 'gamed' ? '🚩' : r.verdict === 'inconclusive' ? '🟡' : '❌';
   const sIcon = { improved: '🟢', regressed: '🔴', unchanged: '⚪', inconclusive: '🟡', unmeasurable: '⚫' };
@@ -1529,7 +1644,7 @@ function renderMarkdown(r) {
     `\`${r.base} → ${r.head}\` · ${r.mode} mode${r.repeat > 1 ? ` · ×${r.repeat}` : ''}`,
     '',
     ...(r.mandates ? [r.mandates.map((md) => `> ⛔ **Protected path touched:** \`${md.name}\`${md.reason ? ': ' + md.reason : ''} (touched \`${md.files.join('`, `')}\`)${md.removed ? ' (deleted in this same change; it stays in force for the change that removes it)' : md.edited ? ' (edited in this same change; the version before the change stays in force for the change that edits it)' : ''}`).join('\n'), ''] : []),
-    ...(r.explained ? [...r.explained.map((x) => `> ${x.noted ? 'ℹ️ **Note:**' : '✋ **Needs a look:**'} ${x.what}${x.items ? ': `' + x.items.join('`, `') + '`' : ''}`), ...(r.explained.some((x) => !x.noted && x.allowable) ? ['>', `> To accept this, someone with write access who did not open this PR comments \`sawbuck-allow: ${allowNames(r)}<their reason>\` on it, and the check is run again.${allowNames(r) ? ' A reason lets through only what it names when there is more than one thing.' : ''}`] : []), ''] : []),
+    ...(r.explained ? [...r.explained.map((x) => `> ${x.noted ? 'ℹ️ **Note:**' : '✋ **Needs a look:**'} ${x.what}${x.items ? ': `' + x.items.join('`, `') + '`' : ''}`), ...mdWayOut(r), ''] : []),
     '| metric | before | after | Δ | status | confidence |',
     '|---|--:|--:|--:|---|---|',
     rows,
