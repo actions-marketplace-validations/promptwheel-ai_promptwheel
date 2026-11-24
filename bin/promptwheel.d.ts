@@ -46,6 +46,8 @@ export interface MetricConfig {
   guard?: boolean;
   /** On a guard: a trusted regression is let through when the metric named in `gain` improved in the same change (earned in the source) and this one got worse by a share of its old value no larger than `base + rate * gain`. Part of the guard: a change cannot write or loosen its own. */
   budget?: { gain: string; base?: number; rate?: number };
+  /** The noise band for this metric, in its own units: a difference no larger than this is `inconclusive`, never a win and never a failure. For a number that does not hold still (a model-graded score, a timing). It replaces the band measured across repeats, so it holds at one run a side and more repeats do not widen it. Not read on a pass/fail metric or an `exact` one. Part of how the metric is judged: a change is held to the band the contract had before it, and a band it adds counts from the next change on. `calibrate()` measures one. */
+  noise?: number;
   /** Read a value even when `cmd` exits nonzero (never needed for `extract: 'exit'`). */
   allowNonzero?: boolean;
   /** Per-command timeout, default 300. */
@@ -120,6 +122,12 @@ export interface CheckOptions {
   detectGaming?: boolean;
   /** A declared override reason (the same as `--allow` or a `Promptwheel-Allow:` commit trailer): a would-be `gamed`, or an `unprovable` win (its source-only re-run could not be applied), reads `pass`, recorded in `report.allowed`. */
   allow?: string;
+  /** Add one short row for this run to the record (in the repo's git folder, never the working tree). Default `false`: the CLI's `run` adds a row unless `--no-record`, the library only when asked. The record never changes a verdict. */
+  record?: boolean;
+  /** A short name for the change, kept in the row when `record` is on. */
+  label?: string;
+  /** A folder outside the repository that keeps the base's measurement between runs (`--base-cache`). A kept number is reused only for the same tree measured the same way (commands, setup, env, linked dirs, repeat count, engine version, platform), and only a clean measurement is kept. A folder inside the repository throws a `ConfigError`: a kept number the change can reach is a goalpost. */
+  baseCache?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -136,8 +144,10 @@ export interface Evaluation {
   /** `false` only for a guarded metric with a trusted regression. */
   ok: boolean;
   confidence: Confidence;
-  /** The measured jitter band (max spread across repeats); `null` when unmeasurable. */
+  /** The noise band the delta was held against: the one the contract declares for the metric, else the measured jitter (max spread across repeats); `null` when unmeasurable. */
   noise: number | null;
+  /** Only where the band was declared: the measured jitter (max spread across repeats), reported beside it. */
+  spread?: number;
   /** A guarded pass/fail metric stuck at 0 at both refs: it protects nothing. */
   inert?: true;
 }
@@ -152,6 +162,8 @@ export interface MetricResult extends Evaluation {
   cause?: 'missing-dependency' | 'failing' | 'too-much-output';
   /** With `cause: 'missing-dependency'`: the line that names what is missing, at most 200 characters. */
   detail?: string;
+  /** The command failed at the base for want of something not installed (a tool, a module, a file inside a package) and ran at the head. So the earlier state did not run: it did not fail. Both commits are measured with what is installed now, and a change that removes a tool the earlier tests need looks like this. The reading alone: no verdict reads it yet. */
+  baseUnrun?: { cause: 'missing-dependency'; detail: string };
   /** `true` when the win did not survive the source-only re-run; `null` when the source-only patch could not be applied (then `unprovable` is set and the verdict is `inconclusive`, never `pass`). Absent without gaming detection or when the metric did not improve. */
   gamed?: boolean | null;
   /** `true`: the source-only patch could not be applied, so this win could not be re-proven and the verdict is `inconclusive`. `false` only after a declared override cleared it (then `allowed` is `true`). */
@@ -245,6 +257,8 @@ export interface Report {
   mode: 'refs' | 'working';
   repeat: number;
   verdict: Verdict;
+  /** Present only when the base's numbers were kept from an earlier run (`baseCache`) and not measured in this one: when they were measured (ISO time). */
+  baseMeasured?: string;
   metrics: MetricResult[];
   /** Present only when a mandate was violated (the verdict is then `fail`). */
   mandates?: MandateViolation[];
@@ -254,6 +268,8 @@ export interface Report {
   allowable?: string[];
   /** `true` when the contract at the base holds `"allowFromAuthor": true`: on a pull request the comment of the account that opened it counts. */
   openerCounts?: true;
+  /** In a run between two commits with more than one commit between them: an earlier commit of the change (`at`, short) added `added` tests, by name, and the change as it stands adds none. `names` holds at most ten of them, `more` how many are left out. A note for a reader, never part of a verdict. */
+  testsTakenOut?: { added: number; names: string[]; more: number; at: string };
   /** Present only when the `setup` command failed: at which ref, with what exit code, and its last output line. */
   setup?: { base?: SetupFailure; head?: SetupFailure };
   provenance: Provenance;
@@ -319,6 +335,52 @@ export interface CountChange {
  */
 export declare function changeCounts(options?: Pick<CheckOptions, 'repo' | 'base' | 'head' | 'config'>): Record<string, CountChange | null> | null;
 
+/** What `calibrate()` found for one metric. */
+export interface CalibratedMetric {
+  name: string;
+  /** How many of the runs gave a number. */
+  runs: number;
+  median: number | null;
+  /** The widest gap between the readings. */
+  spread: number;
+  /** The band to write on the metric as `noise`; `null` when a run gave no number. */
+  noise: number | null;
+}
+
+export interface Calibration {
+  /** The commit the metrics were run at (short sha). */
+  ref: string;
+  /** Readings asked for per metric. */
+  runs: number;
+  /** The runs a side the band is for. */
+  repeat: number;
+  metrics: CalibratedMetric[];
+}
+
+export interface CalibrateOptions extends Pick<CheckOptions, 'repo' | 'config' | 'repeat'> {
+  /** The commit to measure at. Default `HEAD`. */
+  ref?: string;
+  /** Readings per metric. Default 20, at least 4. */
+  runs?: number;
+  /** Measure only the metric with this name. */
+  metric?: string;
+}
+
+/**
+ * Measures the noise band each metric needs: runs it `runs` times at one commit, in a throwaway worktree, and gives
+ * the band for `repeat` runs a side. A pass/fail metric and an `exact` one take no band and are left out. Writes
+ * nothing: a band goes into the contract by hand, as `noise` on the metric. Throws a `ConfigError` (exit code 64)
+ * as `check` does, and when `metric` names no metric that takes a band.
+ */
+export declare function calibrate(options?: CalibrateOptions): Calibration;
+
+/**
+ * The noise band a metric with these readings needs, or `null` with fewer than two readings. Draws pairs of groups of
+ * `repeat` readings and returns the gap between their medians that 95 of 100 pairs stay inside. The draw has a fixed
+ * seed, so the same readings give the same band.
+ */
+export declare function noiseBand(samples: ReadonlyArray<number | null | undefined>, repeat?: number, pairs?: number): number | null;
+
 /**
  * Structurally validate any verdict object against Section 2 (shapes, the fixed vocabularies,
  * and the honest-verdict rules). Zero dependency, so a third-party implementation can self-check
@@ -339,7 +401,7 @@ export declare function median(samples: ReadonlyArray<number | null | undefined>
 /** `max - min` of the non-null samples; `0` when there are none. */
 export declare function spread(samples: ReadonlyArray<number | null | undefined>): number;
 
-/** The credibility core: compare before/after samples and trust the delta only if it clears the observed noise band. */
+/** The credibility core: compare before/after samples and trust the delta only if it clears the noise band (the metric's declared `noise`, else the jitter observed across repeats). */
 export declare function evaluate(
   metric: Pick<MetricConfig, 'direction' | 'guard' | 'extract'>,
   beforeSamples: ReadonlyArray<number | null>,
@@ -437,3 +499,41 @@ export declare function environmentNote(env?: Record<string, string | undefined>
 export declare function allowFromComments(comments: unknown[], opts?: { author?: string; allowFromAuthor?: boolean }): string;
 /** The same, with the login whose comment was left out because it opened the pull request (`skipped`, '' if none). */
 export declare function allowDecision(comments: unknown[], opts?: { author?: string; allowFromAuthor?: boolean }): { reason: string; skipped: string };
+
+/** One test of a file, read by name (0.8.17). `asserts` is -1 for a row of a Go table-driven test. */
+export interface NamedTest { name: string; line: number; asserts: number; skipped: boolean }
+/** Each test in a file's text, by its name. No parser: one small reader for each language the counting tripwires read. A file of another kind holds none. */
+export declare function testsIn(path: string, text: string): NamedTest[];
+/** The tests an earlier step of a change added and its last step no longer adds. `steps` are the change's commits in order, each with the commit it is held against. `null` when there is nothing to say or a step cannot be read. */
+export declare function testsTakenOut(repo: string, steps: { base: string; head: string }[]): { added: number; names: string[]; more: number; at: string } | null;
+
+// ---------------------------------------------------------------------------
+// The record's views. The CLI's `insights`, `playbook` and `suggest` are built on these.
+// ---------------------------------------------------------------------------
+
+/** One key of the record, folded with decay: a metric, a metric in a folder (`metric @ folder`), or a metric under a label (`metric # label`). */
+export interface RecordKey {
+  key: string;
+  metric: string;
+  /** Weighted runs that measured this key. */
+  w: number;
+  /** Runs that measured this key, unweighted. */
+  n: number;
+  /** Weighted runs in which it improved, and in which it got worse. */
+  imp: number;
+  reg: number;
+  /** Weighted runs in which it moved either way. A key earns a line in the playbook at 3. */
+  moved: number;
+  effects: number[];
+  cohorts: Record<string, { imp: number; reg: number }>;
+  last: string | null;
+}
+
+/** Fold rows of the record (oldest first) into decayed counts for each key. A row counts half as much every 20 rows after it. A row that is not a row is skipped. */
+export declare function foldOutcomes(runs: ReadonlyArray<Record<string, unknown>>): RecordKey[];
+
+/** How often a key helped when it moved, pulled toward a half while there is little to go on: `(1 + improved) / (2 + improved + regressed)`. */
+export declare function betaMean(improved: number, regressed: number): number;
+
+/** A key's lever (how often it helped, times how often it moved) and its UCB score, which adds a bonus that shrinks as the key is tried more. */
+export declare function scoreKey(key: Pick<RecordKey, 'imp' | 'reg' | 'moved' | 'w' | 'effects'>, totalWeight: number): { p: number; move: number; lever: number; ucb: number; effect: number };
