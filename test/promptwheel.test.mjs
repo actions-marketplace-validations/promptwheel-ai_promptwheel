@@ -3640,6 +3640,31 @@ test('--base-cache: a kept number answers only for the same tree measured the sa
   assert.ok(w1.baseMeasured); assert.equal(w1.metrics[0].before, 2); assert.equal(w1.metrics[0].after, 5);
   a.done();
 });
+// lead L64: on a Mac the temp folder sits behind a symlink (/var is /private/var), and git lists a worktree by its real
+// path. The self-heal named its folders through the link, never matched a registered worktree, and took a live one
+// (over an hour old, still measuring) for one a killed run left behind. The base-cache guard compared the real path of
+// the repo with the folder as typed, so a folder inside the repo named through a link read as outside.
+test('self-heal through a temp folder behind a symlink: a registered worktree another run is measuring in is left alone', () => {
+  const realTmp = mkdtempSync(join(tmpdir(), 'pw-heal-real-')); const link = `${realTmp}-link`; symlinkSync(realTmp, link);
+  const d = tmpRepo([TODOS]); writeFileSync(join(d, 'app.js'), 'a\n'); commitAll(d, 'base');
+  const live = join(link, `promptwheel-src-${ownerTag(d)}-LIVE02`);
+  execFileSync('git', ['worktree', 'add', '--quiet', '--detach', live, 'HEAD'], { cwd: d });
+  const old = new Date(Date.now() - 7200_000); utimesSync(live, old, old);
+  pwTmp(link, d, ['run', '--working']);
+  const listed = execFileSync('git', ['worktree', 'list', '--porcelain'], { cwd: d, encoding: 'utf8' });
+  assert.match(listed, /-LIVE02$/m, 'still registered'); assert.equal(existsSync(live), true, 'still on disk');
+  execFileSync('git', ['worktree', 'remove', '--force', live], { cwd: d });
+  for (const p of [link, realTmp, d]) rmSync(p, { recursive: true, force: true });
+});
+test('--base-cache: a folder inside the repository named through a symlink is refused as well', () => {
+  const a = countedRepo(), base = rev(a.d); a.level(2, 'a try');
+  const link = `${a.d}-link`; symlinkSync(a.d, link);
+  const refused = (e) => e.name === 'ConfigError' && e.exitCode === 64 && /outside the repository/.test(e.message);
+  assert.throws(() => check({ repo: a.d, base, head: 'HEAD', baseCache: join(link, '.kept') }), refused, 'the folder named through the link');
+  assert.throws(() => check({ repo: link, base, head: 'HEAD', baseCache: join(a.d, '.kept') }), refused, 'the repo named through the link');
+  assert.equal(a.times(), 0, 'refused before anything is run');
+  rmSync(link, { force: true });
+});
 test('--base-cache: the folder must sit outside the repository, and a base that gave no number is not kept', () => {
   const a = countedRepo(), base = rev(a.d);
   a.level(2, 'a try');
@@ -4634,6 +4659,8 @@ test('playbook and suggest run over a real record; the playbook lists what was t
   writeFileSync(join(d, 'app/x.js'), 'a\nb\n'); commitAll(d, 'improve');
   pw(d, ['run', '--base', 'HEAD~1', '--head', 'HEAD', '--label', 'remove todos']);
   r = pw(d, ['playbook']); assert.equal(r.code, 0, r.out); assert.match(r.out, /Nothing has earned a line yet/); assert.doesNotMatch(r.out, /Tried and thrown away/);
+  // one run is one run (queue row Q51: the views said "1 checked runs")
+  for (const c of ['playbook', 'insights', 'suggest']) { const o = pw(d, [c]).out; assert.match(o, /\b1 checked run\b(?!s)/, c); assert.doesNotMatch(o, /\b1 checked runs\b/, c); }
   writeFileSync(join(d, 'app/x.js'), 'a\nb // TODO\nc // TODO\n'); commitAll(d, 'regress2'); pw(d, ['run', '--base', 'HEAD~1', '--head', 'HEAD']);
   writeFileSync(join(d, 'app/x.js'), 'a\nb\nc\n'); commitAll(d, 'improve2'); pw(d, ['run', '--base', 'HEAD~1', '--head', 'HEAD']);
   writeFileSync(join(d, 'app/x.js'), 'a // TODO\n'); commitAll(d, 'regress3'); pw(d, ['run', '--base', 'HEAD~1', '--head', 'HEAD']);
@@ -4678,7 +4705,7 @@ test('the wheel in the CLI: --help names each command, and an unknown flag to on
 // the door itself; the step's own behaviour is held by test/improve-loop.test.mjs.
 test('improve is a door onto the loop step: its record, its line and its exit code are the step\'s, and --goal is another name for --target', () => {
   const d = tmpRepo([TODOS]); writeFileSync(join(d, 'app.js'), 'a // TODO\nb // TODO\n'); commitAll(d, 'base'); const base = rev(d);
-  let r = pw2(d, ['improve', '--goal', 'todos', '--label', 'one todo out', '--attempt', "sed -i '1s| // TODO||' app.js"]);
+  let r = pw2(d, ['improve', '--goal', 'todos', '--label', 'one todo out', '--attempt', "sed -i.bak '1s| // TODO||' app.js && rm -f app.js.bak"]);
   assert.equal(r.code, 0, r.out + r.err); assert.match(r.out, /^ 1 {2}kept {5}one todo out: todos 2 to 1\n$/);
   assert.equal(execFileSync('git', ['rev-parse', 'HEAD~1'], { cwd: d, encoding: 'utf8' }).trim(), base);
   const lines = readFileSync(join(d, '.git', 'improve', 'attempts.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
@@ -4691,7 +4718,7 @@ test('improve is a door onto the loop step: its record, its line and its exit co
 // The README's first loop example, run as it is written there, and then the report a person asks for next. Found by
 // the rehearsal of 0.2.5 from the packed copy (2026-11-22): the line printed what the README says and `improve --report`
 // after it ended with a TypeError. The line and what it prints are read from the README, so the page is held to them.
-// (The line uses `sed -i` with no suffix, as other tests here do: the sed on a Mac does not take that form. Lead L127.)
+// (Every in-place sed here takes a suffix and removes the copy: a Mac's sed refuses `sed -i` with none. Lead L127.)
 test('the README\'s own improve line, as written, on a repo with one failing test and no config: what it prints, and then --report', () => {
   const readme = readFileSync(join(dirname(ENGINE), '..', 'README.md'), 'utf8');
   const m = readme.match(/```\npromptwheel improve --attempt "(.+)"\n\n# ( 1 {2}kept .+)\n```/);
@@ -4710,13 +4737,13 @@ test('the README\'s own improve line, as written, on a repo with one failing tes
 test('improve asks the engine it ships with, whatever PROMPTWHEEL says, and hands the attempt your environment', () => {
   const d = tmpRepo([TODOS]); writeFileSync(join(d, 'app.js'), 'a // TODO\n'); commitAll(d, 'base');
   const seen = join(mkdtempSync(join(tmpdir(), 'pw-door-')), 'env.txt');
-  const r = spawnSync(process.execPath, [ENGINE, 'improve', '--target', 'todos', '--attempt', `echo "$MINE $PROMPTWHEEL $GIT_NO_REPLACE_OBJECTS" > ${seen}; sed -i 's| // TODO||' app.js`], { cwd: d, encoding: 'utf8', env: { ...process.env, PROMPTWHEEL: '/nowhere/promptwheel.mjs', MINE: 'mine' } });
+  const r = spawnSync(process.execPath, [ENGINE, 'improve', '--target', 'todos', '--attempt', `echo "$MINE $PROMPTWHEEL $GIT_NO_REPLACE_OBJECTS" > ${seen}; sed -i.bak 's| // TODO||' app.js && rm -f app.js.bak`], { cwd: d, encoding: 'utf8', env: { ...process.env, PROMPTWHEEL: '/nowhere/promptwheel.mjs', MINE: 'mine' } });
   assert.equal(r.status, 0, r.stdout + r.stderr);
   assert.equal(readFileSync(seen, 'utf8').trim(), 'mine', 'the attempt has your variable, no PROMPTWHEEL, and none of the engine\'s own git settings');
 });
 test('the views over a run of several turns: the playbook prints its path from the loop\'s record, a turn that changed nothing carries the last reading, and insights counts the run', () => {
   const d = tmpRepo([TODOS]); writeFileSync(join(d, 'app.js'), 'a // TODO\nb // TODO\n'); commitAll(d, 'base');
-  const attempt = `case "$PW_TURN" in 1) echo helper > helper.txt;; 2) sed -i '1s| // TODO||' app.js;; esac`;
+  const attempt = `case "$PW_TURN" in 1) echo helper > helper.txt;; 2) sed -i.bak '1s| // TODO||' app.js && rm -f app.js.bak;; esac`;
   const r = pw2(d, ['improve', '--target', 'todos', '--label', 'two steps', '--turns', '4', '--attempt', attempt]);
   assert.equal(r.code, 0, r.out + r.err);
   assert.match(pw(d, ['playbook']).out, /- \*\*two steps\*\*: kept at turn 2 of 3: `todos` 2 → 2 → 1 → 1/);
@@ -4769,18 +4796,18 @@ const addRepo = () => {   // no config file: a package whose one test fails unti
   writeFileSync(join(z, 'test', 'add.test.js'), "const t = require('node:test'), a = require('node:assert')\nt.test('add', () => a.equal(require('../src/add.js').add(2, 2), 4))\n");
   g('add', '-A'); g('commit', '-qm', 'base'); return { z, g };
 };
-const FIX_ADD = "sed -i 's/a - b/a + b/' src/add.js";
+const FIX_ADD = "sed -i.bak 's/a - b/a + b/' src/add.js && rm -f src/add.js.bak";
 // an attempt that leaves its mark outside the repo, where no put-back reaches: whether it ran at all
 const ranMark = () => { const f = join(mkdtempSync(join(tmpdir(), 'pw-ran-')), 'ran'); return { f, attempt: `touch '${f}'` }; };
 test('improve: with no target named, the door picks the contract\'s only measure: one measure, a target beside tripwires, no config file, and the contract init writes', () => {
   const d = tmpRepo([TODOS]); writeFileSync(join(d, 'app.js'), 'a // TODO\nb // TODO\n'); commitAll(d, 'base');
-  let r = pw2(d, ['improve', '--attempt', "sed -i '1s| // TODO||' app.js"]);
+  let r = pw2(d, ['improve', '--attempt', "sed -i.bak '1s| // TODO||' app.js && rm -f app.js.bak"]);
   assert.equal(r.code, 0, r.out + r.err); assert.match(r.out, / kept .*todos 2 to 1/);
   assert.equal(JSON.parse(readFileSync(join(d, '.git', 'improve', 'attempts.jsonl'), 'utf8').trim()).target, 'todos');
   const t = tmpRepo([TRIP, TODOS]); writeFileSync(join(t, 'app.js'), 'a // TODO\n'); writeFileSync(join(t, 'notes.txt'), 'x\n'); commitAll(t, 'base');
-  r = pw2(t, ['improve', '--attempt', "sed -i 's| // TODO||' app.js"]); assert.equal(r.code, 0, r.out + r.err); assert.match(r.out, / kept .*todos 1 to 0/, 'dashes is a tripwire');
+  r = pw2(t, ['improve', '--attempt', "sed -i.bak 's| // TODO||' app.js && rm -f app.js.bak"]); assert.equal(r.code, 0, r.out + r.err); assert.match(r.out, / kept .*todos 1 to 0/, 'dashes is a tripwire');
   const w = tmpRepo([TRIP]); writeFileSync(join(w, 'notes.txt'), 'a -- b\n'); commitAll(w, 'base');
-  r = pw2(w, ['improve', '--attempt', "sed -i 's/ -- / /' notes.txt"]); assert.equal(r.code, 0, r.out + r.err); assert.match(r.out, / kept .*: dashes \d+ to \d+$/m, 'a contract\'s one measure, tripwire or not');
+  r = pw2(w, ['improve', '--attempt', "sed -i.bak 's/ -- / /' notes.txt && rm -f notes.txt.bak"]); assert.equal(r.code, 0, r.out + r.err); assert.match(r.out, / kept .*: dashes \d+ to \d+$/m, 'a contract\'s one measure, tripwire or not');
   const { z } = addRepo();
   r = pw2(z, ['improve', '--attempt', FIX_ADD]); assert.equal(r.code, 0, r.out + r.err); assert.match(r.out, / kept .*tests_pass 0 to 1/);
   const { z: y, g } = addRepo(); assert.equal(pw(y, ['init']).code, 0); g('add', '-A'); g('commit', '-qm', 'contract');
@@ -4796,7 +4823,7 @@ test('improve: on a contract of several measures with none named score, the door
     assert.equal(existsSync(m.f), false, 'the attempt never ran');
   }
   const h = pw2(d, ['improve', '--help']); assert.equal(h.code, 0, h.err); assert.match(h.out, /--attempt/);
-  const k = pw2(d, ['improve', '--goal', 'todos', '--attempt', "sed -i 's| // TODO||' app.js"]); assert.equal(k.code, 0, k.out + k.err); assert.match(k.out, / kept .*todos 1 to 0/);
+  const k = pw2(d, ['improve', '--goal', 'todos', '--attempt', "sed -i.bak 's| // TODO||' app.js && rm -f app.js.bak"]); assert.equal(k.code, 0, k.out + k.err); assert.match(k.out, / kept .*todos 1 to 0/);
   const a = tmpRepo([TRIP, { ...TRIP, name: 'dashes2' }]); writeFileSync(join(a, 'notes.txt'), 'x\n'); commitAll(a, 'base');
   const m = ranMark(); const r = pw2(a, ['improve', '--attempt', m.attempt]); assert.equal(r.code, 64); assert.equal(existsSync(m.f), false);
   assert.match(r.err, /the contract's 2 measures are all tripwires and none is named score, so name the one this run is for: --target <dashes \| dashes2>/);
@@ -5055,4 +5082,277 @@ test('run: an earlier state that could not run for want of something not install
   // and a later state that cannot run is not this: nothing is marked when the tool goes missing AFTER
   m = mk((d) => { pkg(d, { test: 'node --test' }); commitAll(d, 'a'); pkg(d, { test: 'node --test', posttest: 'a-tool-nobody-installed' }); commitAll(d, 'b'); });
   assert.equal(m.before, 1); assert.equal(m.after, 0); assert.equal(m.baseUnrun, undefined);
+});
+
+// ---- 0.8.20: on a pull request, tests the change added and then took out send it back (queue row Q54) -------------
+// The note of 0.8.17 (testsTakenOut) spoke on none of 128 fresh controls and on 14 of 139 objected pull requests. On a
+// pull request (the action passes --pull-request) it is a guard of its own: the job fails, a person's reason lets it
+// through, and the comment's line keeps the note's sentence with the mark every send-back has. Nowhere else.
+const takenOutRepo = () => {
+  const d = prRepo(); const base = rev(d);
+  put(d, 'test/more.test.js', T3); commitAll(d, 'three more tests');
+  put(d, 'src/a.js', 'exports.f = () => 1 // tidied\n'); commitAll(d, 'tidy');
+  unlinkSync(join(d, 'test/more.test.js')); commitAll(d, 'drop the tests that went red');
+  return { d, base };
+};
+test('on a pull request, a change that took out every test it had added fails, with the note\'s sentence as a line that needs a look and the way out after it', () => {
+  const { d, base } = takenOutRepo();
+  // pw2 keeps stdout apart: on a failing verdict the command also writes to stderr, and range() reads both together
+  const r = pw2(d, ['run', '--base', base, '--head', 'HEAD', '--no-record', '--json', '--pull-request']); const rep = JSON.parse(r.out);
+  assert.equal(r.code, 1, 'the job fails'); assert.equal(rep.verdict, 'fail');
+  assert.equal(conformsToContract(rep).ok, true, JSON.stringify(conformsToContract(rep).errors || conformsToContract(rep)));   // second read of 0.2.7: the guard had no direction
+  const md = renderMarkdown(rep);
+  assert.match(md, /> ✋ \*\*Needs a look:\*\* an earlier commit of this pull request \(`[0-9a-f]{7,}`\) added 3 tests\. None of them is in it now: `adds four`, `adds three`, `adds two`\./);
+  assert.doesNotMatch(md, /ℹ️ \*\*Note:\*\* an earlier commit of this pull request/, 'not said twice');
+  assert.match(md, /sawbuck-allow:/, 'the way out follows');
+});
+test('on a pull request, a person\'s reason lets the change that took its added tests out through', () => {
+  const { d, base } = takenOutRepo();
+  const { code, rep } = range(d, base, 'HEAD', '--pull-request', '--allow', 'the three tests moved to the next pull request');
+  assert.equal(code, 0, 'let through'); assert.equal(rep.verdict, 'pass');
+  assert.ok(rep.allowed && (rep.allowed.cleared || []).includes('tests_taken_out'), 'and the report says what was let through');
+  assert.equal(conformsToContract(rep).ok, true, 'and the report conforms');
+});
+test('without --pull-request the change that took its added tests out is a note, as before', () => {
+  const { d, base } = takenOutRepo();
+  const { code, rep } = range(d, base);
+  assert.equal(code, 0); assert.equal(rep.verdict, 'pass'); assert.ok(rep.testsTakenOut);
+  assert.ok(!rep.metrics.some((m) => m.name === 'tests_taken_out'), 'no guard of its own off a pull request');
+});
+test('the action passes --pull-request on a pull request, and only there', () => {
+  const action = readFileSync(join(dirname(ENGINE), '..', 'action.yml'), 'utf8');
+  assert.match(action, /github\.event_name == 'pull_request' && '--pull-request'/);
+});
+
+// ---- 0.8.20: a note when two or more named tests are gone, or a file that stays lost every test (queue row Q55) ----
+// The reading R1(c) held both of its lines on 128 fresh controls; five of the six it spoke on were renames or rewrites,
+// so the note says what was read and not what it means (the words he approved on 2026-11-23).
+const goneNote = (rep) => renderMarkdown(rep).split('\n').find((l) => l.includes('named in the changed files')) || '';
+test('a change that takes two named tests out of a file that stays: a note that names them, and says a rename reads the same way; never a verdict', () => {
+  const d = prRepo(); put(d, 'test/more.test.js', T3); commitAll(d, 'three tests'); const base = rev(d);
+  put(d, 'test/more.test.js', "const t=require('node:test'),a=require('node:assert');\nt.test('adds two', () => a.equal(1 + 1, 2));\n"); commitAll(d, 'two tests out');
+  const { code, rep } = range(d, base);
+  assert.equal(code, 0); assert.equal(rep.verdict, 'pass', 'a note only');
+  assert.deepEqual(rep.testsGone, { gone: 2, names: ['adds four', 'adds three'], more: 0, emptied: [] });
+  assert.equal(goneNote(rep), '> ℹ️ **Note:** 2 tests that were named in the changed files are not named in them now: `adds four`, `adds three`. A rename reads the same way.');
+});
+test('the note is not said for one name gone, for tests moved to another changed file, or for a deleted file of one test; it is said for a file that stays and lost its only test', () => {
+  let d = prRepo(); put(d, 'test/more.test.js', T3); commitAll(d, 'three tests'); let base = rev(d);
+  put(d, 'test/more.test.js', "const t=require('node:test'),a=require('node:assert');\nt.test('adds two', () => a.equal(1 + 1, 2));\nt.test('adds three', () => a.equal(1 + 2, 3));\n"); commitAll(d, 'one out');
+  assert.equal(range(d, base).rep.testsGone, undefined, 'one name gone');
+  d = prRepo(); put(d, 'test/more.test.js', T3); commitAll(d, 'three tests'); base = rev(d);
+  unlinkSync(join(d, 'test/more.test.js')); put(d, 'test/moved.test.js', T3); commitAll(d, 'moved');
+  assert.equal(range(d, base).rep.testsGone, undefined, 'the same names in another changed file');
+  d = prRepo(); put(d, 'test/one.test.js', "const t=require('node:test'),a=require('node:assert');\nt.test('only', () => a.ok(true));\n"); commitAll(d, 'one test'); base = rev(d);
+  unlinkSync(join(d, 'test/one.test.js')); commitAll(d, 'the file goes');
+  assert.equal(range(d, base).rep.testsGone, undefined, 'a deleted file of one test');
+  d = prRepo(); put(d, 'test/one.test.js', "const t=require('node:test'),a=require('node:assert');\nt.test('only', () => a.ok(true));\n"); commitAll(d, 'one test'); base = rev(d);
+  put(d, 'test/one.test.js', "// nothing here yet\n"); commitAll(d, 'emptied');
+  const rep = range(d, base).rep;
+  assert.deepEqual(rep.testsGone, { gone: 1, names: ['only'], more: 0, emptied: ['test/one.test.js'] });
+  assert.equal(goneNote(rep), '> ℹ️ **Note:** 1 test that was named in the changed files is not named in them now: `only`. A rename reads the same way.');
+});
+test('the note reads the change from where it left the base: tests the base gained after that are not read as taken out', () => {
+  const d = prRepo(); const fork = rev(d);
+  gitIn(d, 'checkout', '-q', '-b', 'topic'); put(d, 'src/a.js', 'exports.f = () => 1 // tidied\n'); commitAll(d, 'tidy');
+  gitIn(d, 'checkout', '-q', '-'); put(d, 'test/more.test.js', T3); commitAll(d, 'the base gains three tests'); const main = rev(d);
+  gitIn(d, 'checkout', '-q', 'topic');
+  assert.notEqual(main, fork);
+  const { rep } = range(d, main);
+  assert.equal(rep.testsGone, undefined, 'the change took no test out');
+});
+// second read of 0.2.7: a test moved out of a file that stays left that file "emptied" with nothing gone, and the note said
+// "0 tests ... : ."; a test file grown past what the note reads (2 MiB) read as all its tests gone
+test('the note is not said for tests that moved out of a file that stays: nothing is gone', () => {
+  const d = prRepo(); put(d, 'test/more.test.js', T3); commitAll(d, 'three tests'); const base = rev(d);
+  put(d, 'test/more.test.js', '// the tests moved\n'); put(d, 'test/moved.test.js', T3); commitAll(d, 'move them');
+  const { rep } = range(d, base);
+  assert.equal(rep.testsGone, undefined); assert.doesNotMatch(renderMarkdown(rep), /named in the changed files/);
+});
+test('a test file grown past what the note reads is left out of it, not read as its tests gone', () => {
+  const d = prRepo(); put(d, 'test/more.test.js', T3); commitAll(d, 'three tests'); const base = rev(d);
+  put(d, 'test/more.test.js', T3 + '// ' + 'x'.repeat(2.1 * 1024 * 1024) + '\n'); commitAll(d, 'a long comment');
+  const { rep } = range(d, base);
+  assert.equal(rep.testsGone, undefined);
+});
+// re-read of 0.2.7: leaving an unread file out of a step's tally made tests that moved out of a file grown past what the
+// note reads, and back, read as added and then taken out: a false send-back on a pull request. A step with a test file
+// it cannot read is a step it cannot read: the notes say nothing, as for a commit that is not in the clone.
+const BIG = (names, pad) => `const t=require('node:test');\n${names.map((n) => `t.test('${n}',()=>{})`).join('\n')}\n${`// ${'x'.repeat(98)}\n`.repeat(pad)}`;
+test('a test file a step cannot read silences the notes: tests moved out of a file grown past 2 MiB and back are no send-back', () => {
+  const d = prRepo(); put(d, 'test/big.test.js', BIG(['x', 'y', 'z', 'k'], 15000)); commitAll(d, 'a big test file'); const base = rev(d);
+  put(d, 'test/big.test.js', BIG(['k'], 25000)); put(d, 'test/new.test.js', BIG(['x', 'y', 'z'], 0)); commitAll(d, 'move three out, more fixtures');
+  put(d, 'test/big.test.js', BIG(['k', 'x', 'y', 'z'], 25000)); unlinkSync(join(d, 'test/new.test.js')); commitAll(d, 'move them back');
+  const r = pw2(d, ['run', '--base', base, '--head', 'HEAD', '--no-record', '--json', '--pull-request']); const rep = JSON.parse(r.out);
+  assert.equal(rep.testsTakenOut, undefined, 'no note'); assert.ok(!rep.metrics.some((m) => m.name === 'tests_taken_out'), 'no send-back');
+  assert.equal(rep.testsGone, undefined);
+});
+// last look at 0.2.7: the rule above ran over every changed source file, so a built bundle past 2 MiB (dist/index.js), or a
+// small file whose name is not UTF-8, silenced the 0.2.4 note and its send-back where 0.8.19 gave it. Only a file that is a
+// test file (by its path, or by the tests its readable side holds) silences the notes; any other counts as holding none.
+const twoAddedThenOut = (middle) => {
+  const d = prRepo(); const base = rev(d);
+  put(d, 'test/more.test.js', "const t=require('node:test');\nt.test('n1',()=>{})\nt.test('n2',()=>{})\n"); commitAll(d, 'two tests');
+  middle(d); commitAll(d, 'something else');
+  unlinkSync(join(d, 'test/more.test.js')); commitAll(d, 'take them out');
+  const r = pw2(d, ['run', '--base', base, '--head', 'HEAD', '--no-record', '--json', '--pull-request']); return { r, rep: JSON.parse(r.out) };
+};
+test('a built bundle past 2 MiB, or a file whose name is not UTF-8, does not silence the note of tests added and taken out', () => {
+  let { r, rep } = twoAddedThenOut((d) => put(d, 'dist/index.js', '// built\n' + 'x'.repeat(2.6 * 1024 * 1024) + '\n'));
+  assert.deepEqual(rep.testsTakenOut && rep.testsTakenOut.names, ['n1', 'n2'], 'a big file that is not a test file'); assert.equal(r.code, 1, 'and on a pull request it is sent back');
+  ({ r, rep } = twoAddedThenOut((d) => writeFileSync(Buffer.concat([Buffer.from(join(d, 'src', 'caf')), Buffer.from([0xe9]), Buffer.from('.js')]), 'exports.c = 1;\n')));   // a byte name: fs takes a Buffer
+  assert.deepEqual(rep.testsTakenOut && rep.testsTakenOut.names, ['n1', 'n2'], 'a name that is not UTF-8');
+});
+test('a big source file whose readable side holds tests still silences the notes', () => {
+  const d = prRepo(); put(d, 'src/helpers.js', "const t=require('node:test');\nt.test('h1',()=>{})\nt.test('h2',()=>{})\n"); commitAll(d, 'helpers with tests'); const base = rev(d);
+  put(d, 'src/helpers.js', "const t=require('node:test');\nt.test('h1',()=>{})\nt.test('h2',()=>{})\n// " + 'x'.repeat(2.6 * 1024 * 1024) + '\n'); commitAll(d, 'grown past what the notes read');
+  const { rep } = range(d, base); assert.equal(rep.testsGone, undefined); assert.equal(rep.testsTakenOut, undefined);
+});
+
+
+// The job's own log says what the comment says (2026-11-24, proof-bench/ship-vs-check): Claude Code's /ship watch read
+// our failed check's log, not our comment (it reads no bot it was not told to), and found "no cause beyond a failed
+// gate". The step that fails printed only an exit code.
+test('the job log: a failed check says in plain text what its comment says, for an agent that reads only the log', () => {
+  const p = plan({ report: sentBack(), exit: 1 });
+  assert.ok(p.log, 'a failed check has words for its log');
+  assert.match(p.log, /^Sawbuck: sent back$/m);
+  assert.match(p.log, /Needs a look/);
+  assert.match(p.log, /Put back what was removed, and push/, 'the way through, as the comment gives it');
+  assert.match(p.log, /test_count/, 'the measure that moved');
+  assert.doesNotMatch(p.log, /<!--|<details>|<summary>|<code>|<sub>|\*\*|^#+ /m, 'plain text: no markup');
+  assert.doesNotMatch(p.log, /\bunchanged\b/, 'only the measures that moved');
+  assert.equal(plan({ report: prRep(), exit: 0 }).log, '', 'a pass says nothing');
+  assert.ok(plan({ report: sentBack(), exit: 1, comment: 'false' }).log, 'with comments off the log still speaks');
+  assert.match(plan({ report: null, exit: 64, error: 'promptwheel: base ref "x" is not in this clone\n' }).log, /could not run[\s\S]*base ref "x" is not in this clone/);
+});
+test('pr-comment --log writes those words for the step that fails, and nothing on a pass', () => {
+  const d = mkdtempSync(join(TMP_ROOT, 'prl-')); const f = (n) => join(d, n);
+  writeFileSync(f('report.json'), JSON.stringify(sentBack())); writeFileSync(f('comments.jsonl'), '');
+  const run = (...a) => spawnSync('node', [ENGINE, 'pr-comment', '--report', f('report.json'), '--comments', f('comments.jsonl'), '--key', KEY, '--body', f('body.md'), '--log', f('log.txt'), ...a], { encoding: 'utf8' });
+  let r = run('--exit', '1'); assert.equal(r.status, 0, r.stderr); assert.match(readFileSync(f('log.txt'), 'utf8'), /^Sawbuck: sent back$/m);
+  writeFileSync(f('report.json'), JSON.stringify(prRep())); r = run('--exit', '0'); assert.equal(r.status, 0, r.stderr); assert.equal(readFileSync(f('log.txt'), 'utf8'), '');
+  rmSync(d, { recursive: true, force: true });
+});
+test('the Action: the step that fails prints the words and raises one annotation, so a failed check says why', () => {
+  const action = readFileSync(join(dirname(ENGINE), '..', 'action.yml'), 'utf8');
+  assert.match(action, /pr-comment [\s\S]*--log "\$RUNNER_TEMP\/promptwheel\.log"/, 'the gate step writes the words');
+  const last = action.slice(action.lastIndexOf('GATE_EXIT: ${{ steps.gate.outputs.exit }}'));
+  assert.match(last, /cat "\$RUNNER_TEMP\/promptwheel\.log"/, 'the failing step prints them');
+  assert.match(last, /::error title=Sawbuck/, 'and raises one annotation');
+});
+test('the Action: the final step keeps its exit when the words are missing, and comment-only still passes', (t) => {
+  if (spawnSync('bash', ['-c', 'true']).status !== 0) return t.skip('no bash here');
+  const action = readFileSync(join(dirname(ENGINE), '..', 'action.yml'), 'utf8');
+  const lines = action.slice(action.lastIndexOf('GATE_EXIT: ${{ steps.gate.outputs.exit }}')).split('\n');
+  const at = lines.findIndex((l) => /^\s+run: \|$/.test(l)); assert.ok(at > 0, 'the final step has a run block');
+  const body = []; for (const l of lines.slice(at + 1)) { if (l.trim() && !l.startsWith('        ')) break; body.push(l.slice(8)); }
+  const d = mkdtempSync(join(TMP_ROOT, 'fin-')); const script = join(d, 'final.sh'); writeFileSync(script, body.join('\n') + '\n');
+  // as GitHub runs a step with `shell: bash`
+  const run = (env) => spawnSync('bash', ['--noprofile', '--norc', '-eo', 'pipefail', script], { encoding: 'utf8', env: { PATH: process.env.PATH, RUNNER_TEMP: d, INCONCLUSIVE: 'fail', COMMENT_ONLY: 'false', ...env } });
+  // no words written (pr-comment stopped before it wrote them): the exits of 0.8.20, never 1 for a missing file
+  let r = run({ GATE_EXIT: '1', COMMENT_ONLY: 'true' }); assert.equal(r.status, 0, 'comment-only passes whatever happened: ' + r.stdout + r.stderr); assert.match(r.stdout, /comment-only mode/);
+  r = run({ GATE_EXIT: '3' }); assert.equal(r.status, 3, r.stdout + r.stderr);
+  r = run({ GATE_EXIT: '1' }); assert.equal(r.status, 1, r.stdout + r.stderr); assert.match(r.stdout, /^::error title=Sawbuck sent this back::exit 1$/m);
+  r = run({ GATE_EXIT: '0' }); assert.equal(r.status, 0, r.stdout + r.stderr); assert.equal(r.stdout, '');
+  // with the words: printed, then one annotation that carries them on one line
+  writeFileSync(join(d, 'promptwheel.log'), 'Sawbuck: sent back\n  tests_pass  1  0\n100% sure\n');
+  r = run({ GATE_EXIT: '1' }); assert.equal(r.status, 1, r.stdout + r.stderr); assert.match(r.stdout, /^Sawbuck: sent back$/m);
+  assert.match(r.stdout, /^::error title=Sawbuck sent this back::Sawbuck: sent back%0A  tests_pass  1  0%0A100%25 sure$/m);
+  r = run({ GATE_EXIT: '1', COMMENT_ONLY: 'true' }); assert.equal(r.status, 0, r.stdout + r.stderr); assert.match(r.stdout, /^::warning title=Sawbuck would have sent this back::Sawbuck: sent back%0A/m);
+  rmSync(d, { recursive: true, force: true });
+});
+test('the Action: the log is printed with workflow commands stopped, so a file name in it cannot speak to the runner', (t) => {
+  if (spawnSync('bash', ['-c', 'true']).status !== 0) return t.skip('no bash here');
+  const action = readFileSync(join(dirname(ENGINE), '..', 'action.yml'), 'utf8');
+  const lines = action.slice(action.lastIndexOf('GATE_EXIT: ${{ steps.gate.outputs.exit }}')).split('\n');
+  const at = lines.findIndex((l) => /^\s+run: \|$/.test(l));
+  const body = []; for (const l of lines.slice(at + 1)) { if (l.trim() && !l.startsWith('        ')) break; body.push(l.slice(8)); }
+  const d = mkdtempSync(join(TMP_ROOT, 'fin-')); const script = join(d, 'final.sh'); writeFileSync(script, body.join('\n') + '\n');
+  const run = (env) => spawnSync('bash', ['--noprofile', '--norc', '-eo', 'pipefail', script], { encoding: 'utf8', env: { PATH: process.env.PATH, RUNNER_TEMP: d, INCONCLUSIVE: 'fail', COMMENT_ONLY: 'false', ...env } });
+  // git allows a line break in a file name, and the comment names files as they are
+  writeFileSync(join(d, 'promptwheel.log'), 'Sawbuck: sent back\n  .github/workflows/x\n::warning::y.yml\n');
+  for (const env of [{ GATE_EXIT: '1' }, { GATE_EXIT: '1', COMMENT_ONLY: 'true' }]) {
+    const out = run(env).stdout.split('\n');
+    const i = out.findIndex((l) => /^::stop-commands::\S{16,}$/.test(l)); assert.ok(i >= 0, out.join('\n'));
+    const tok = out[i].slice('::stop-commands::'.length); const j = out.indexOf(`::${tok}::`);
+    const inj = out.indexOf('::warning::y.yml');
+    assert.ok(i < inj && inj < j, 'the line from the log sits between the stop and the resume: ' + out.join('\n'));
+  }
+  rmSync(d, { recursive: true, force: true });
+});
+test('types: a CommentPlan built by hand needs no log', () => {
+  assert.match(readFileSync(join(dirname(ENGINE), 'promptwheel.d.ts'), 'utf8'), /\n  log\?: string;/);
+});
+
+// The c-none pattern (proof-bench/ship-vs-check, 2026-11-24): the person's commit changed the source and broke a test the
+// base had; a later commit rewrote that test to the new result. Over the whole pull request it read green to green, and
+// the check passed it. On a pull request it is now a note; where the contract says "testRewrites": "ask", a guard.
+const rewrittenRepo = (contract = null) => {
+  const d = prRepo();
+  if (contract) { pw(d, ['init']); const p = join(d, 'promptwheel.config.json'); const c = JSON.parse(readFileSync(p, 'utf8')); Object.assign(c, contract); writeFileSync(p, JSON.stringify(c, null, 2) + '\n'); commitAll(d, 'the contract'); }
+  const base = rev(d);
+  put(d, 'src/a.js', 'exports.f = () => 2\n'); commitAll(d, 'f returns two now'); const c1 = gitIn(d, 'rev-parse', '--short', 'HEAD');
+  put(d, 'test/a.test.js', NODE_TEST("require('../src/a.js').f(), 2")); commitAll(d, 'align the test with two'); const c2 = gitIn(d, 'rev-parse', '--short', 'HEAD');
+  return { d, base, c1, c2 };
+};
+test('on a pull request, a test the base had, rewritten after an earlier commit changed the source and broke it, is a note that names it', () => {
+  const { d, base, c1, c2 } = rewrittenRepo();
+  const { code, rep } = range(d, base, 'HEAD', '--pull-request');
+  assert.equal(code, 0); assert.equal(rep.verdict, 'pass', 'a plain contract: a note, not a verdict');
+  assert.deepEqual(rep.testsRewritten, { tests: ['test/a.test.js'], more: 0, at: c2, after: c1 });
+  const md = renderMarkdown(rep);
+  assert.match(md, /> ℹ️ \*\*Note:\*\* a later commit of this pull request \(`[0-9a-f]{7,}`\) rewrote a test the base branch had, after an earlier commit \(`[0-9a-f]{7,}`\) changed the source, and the base branch's tests fail on this pull request's source: `test\/a\.test\.js`\./);
+  assert.equal(conformsToContract(rep).ok, true);
+  assert.equal(engineNow.commentPlan({ key: KEY, comments: [], report: rep, exit: 0 }).action, 'create', 'the comment speaks on a pass that holds the note');
+});
+test('where the contract says "testRewrites": "ask", that pull request is sent back, and a person\'s reason lets it through', () => {
+  const { d, base } = rewrittenRepo({ testRewrites: 'ask' });
+  const r = pw2(d, ['run', '--base', base, '--head', 'HEAD', '--no-record', '--json', '--pull-request']); const rep = JSON.parse(r.out);
+  assert.equal(r.code, 1, r.err); assert.equal(rep.verdict, 'fail');
+  assert.ok(rep.metrics.some((m) => m.name === 'tests_rewritten' && m.status === 'regressed'));
+  assert.equal(conformsToContract(rep).ok, true, JSON.stringify(conformsToContract(rep).errors || conformsToContract(rep)));
+  const md = renderMarkdown(rep);
+  assert.match(md, /> ✋ \*\*Needs a look:\*\* a later commit of this pull request \(`[0-9a-f]{7,}`\) rewrote a test the base branch had/);
+  assert.doesNotMatch(md, /ℹ️ \*\*Note:\*\* a later commit of this pull request/, 'not said twice');
+  assert.match(md, /sawbuck-allow:/, 'the way out follows');
+  const ok = range(d, base, 'HEAD', '--pull-request', '--allow', 'the rule changed: two is right now, so the tests change');
+  assert.equal(ok.code, 0); assert.ok(ok.rep.allowed && (ok.rep.allowed.cleared || []).includes('tests_rewritten'));
+});
+test('a rewritten test is not this rule\'s when source and test change in one commit, off a pull request, or when the base\'s tests still pass', () => {
+  let d = prRepo(); let base = rev(d);
+  put(d, 'src/a.js', 'exports.f = () => 2\n'); put(d, 'test/a.test.js', NODE_TEST("require('../src/a.js').f(), 2")); commitAll(d, 'two, and its test');
+  assert.equal(range(d, base, 'HEAD', '--pull-request').rep.testsRewritten, undefined, 'one commit: an ordinary change of behaviour');
+  ({ d, base } = rewrittenRepo());
+  assert.equal(range(d, base).rep.testsRewritten, undefined, 'only on a pull request');
+  d = prRepo(); base = rev(d);
+  put(d, 'src/a.js', 'exports.f = () => 1\nexports.g = () => 3\n'); commitAll(d, 'add g');
+  put(d, 'test/a.test.js', NODE_TEST("require('../src/a.js').f(), 1") + "require('node:test').test('g', () => require('node:assert').equal(require('../src/a.js').g(), 3))\n"); commitAll(d, 'test g');
+  assert.equal(range(d, base, 'HEAD', '--pull-request').rep.testsRewritten, undefined, 'the base\'s tests pass on the new source');
+});
+test('the rewritten-test reader: capped like the others, the source split asked only where needed, a git error is no note', () => {
+  const { d, base, c1, c2 } = rewrittenRepo();
+  const full = (x) => gitIn(d, 'rev-parse', x);
+  const steps = [{ base, head: full(c1) }, { base: full(c1), head: full(c2) }];
+  let calls = 0;
+  const split = (a, b) => { calls++; const names = gitIn(d, 'diff', '--name-only', a, b).split('\n').filter(Boolean); return { source: names.filter((f) => f.startsWith('src/')), nonSource: names.filter((f) => !f.startsWith('src/')) }; };
+  assert.deepEqual(engineNow.testsRewrittenAfter(d, steps, split), { tests: ['test/a.test.js'], more: 0, at: c2, after: c1 });
+  assert.equal(calls, 1, 'one split: the commit before the rewrite (the first reader asked for three)');
+  calls = 0;
+  assert.equal(engineNow.testsRewrittenAfter(d, Array.from({ length: 61 }, () => steps[0]), split), null, 'more than 60 commits: no note');
+  assert.equal(calls, 0, 'and nothing asked');
+  assert.equal(engineNow.testsRewrittenAfter(d, steps, () => { throw new Error('fatal: unable to read tree'); }), null, 'a git error is no note');
+  // through the whole run: a commit of the pull request whose tree git cannot read (a damaged or partial clone)
+  const r2 = rewrittenRepo(); const tree = gitIn(r2.d, 'rev-parse', `${r2.c1}^{tree}`); const obj = join(r2.d, '.git', 'objects', tree.slice(0, 2), tree.slice(2));
+  assert.ok(existsSync(obj), 'the tree is a loose object here'); rmSync(obj);
+  const r = pw2(r2.d, ['run', '--base', r2.base, '--head', 'HEAD', '--no-record', '--json', '--pull-request']);
+  assert.equal(r.code, 0, r.err || r.out); assert.equal(JSON.parse(r.out).testsRewritten, undefined);
+});
+test('a pull request that writes "testRewrites": "ask" into its own contract is held by it: the stricter of the base\'s and its own', () => {
+  const d = prRepo(); pw(d, ['init']); commitAll(d, 'the contract'); const base = rev(d);
+  const p = join(d, 'promptwheel.config.json'); const c = JSON.parse(readFileSync(p, 'utf8')); c.testRewrites = 'ask'; writeFileSync(p, JSON.stringify(c, null, 2) + '\n');
+  put(d, 'src/a.js', 'exports.f = () => 2\n'); commitAll(d, 'f returns two now, and the contract asks');
+  put(d, 'test/a.test.js', NODE_TEST("require('../src/a.js').f(), 2")); commitAll(d, 'align the test with two');
+  const r = pw2(d, ['run', '--base', base, '--head', 'HEAD', '--no-record', '--json', '--pull-request']); const rep = JSON.parse(r.out);
+  assert.ok(rep.metrics.some((m) => m.name === 'tests_rewritten' && m.status === 'regressed'), JSON.stringify(rep.metrics.map((m) => [m.name, m.status])));
 });

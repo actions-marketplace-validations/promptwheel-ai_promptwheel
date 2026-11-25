@@ -82,7 +82,7 @@ runs:
       run: |
         set +e
         node "$GITHUB_ACTION_PATH/bin/promptwheel.mjs" run \
-          --base "${{ inputs.base }}" --head HEAD --repeat "${{ inputs.repeat }}" --json ${ALLOW:+--allow "$ALLOW"} \
+          --base "${{ inputs.base }}" --head HEAD --repeat "${{ inputs.repeat }}" --json ${ALLOW:+--allow "$ALLOW"} ${{ github.event_name == 'pull_request' && '--pull-request' || '' }} \
           > "$RUNNER_TEMP/promptwheel.json" 2> "$RUNNER_TEMP/promptwheel.err"
         code=$?
         cat "$RUNNER_TEMP/promptwheel.err" >&2
@@ -94,7 +94,7 @@ runs:
         plan=$(node "$GITHUB_ACTION_PATH/bin/promptwheel.mjs" pr-comment --report "$RUNNER_TEMP/promptwheel.json" --exit "$code" --error "$RUNNER_TEMP/promptwheel.err" \
           --comments "$RUNNER_TEMP/promptwheel-comments-now.jsonl" --key "$KEY" --note "$RUNNER_TEMP/promptwheel-allow-note.md" \
           --comment "$COMMENT" --inconclusive "$INCONCLUSIVE" --comment-only "$COMMENT_ONLY" \
-          --body "$RUNNER_TEMP/promptwheel.md" --summary "$GITHUB_STEP_SUMMARY")
+          --body "$RUNNER_TEMP/promptwheel.md" --summary "$GITHUB_STEP_SUMMARY" --log "$RUNNER_TEMP/promptwheel.log")
         echo "plan=${plan:-none}" >> "$GITHUB_OUTPUT"
 
     # one comment: made the first time there is something to say, edited in place after that
@@ -125,8 +125,24 @@ runs:
           echo "::warning::Sawbuck could not measure your tests here, so nothing was proved. Protected paths were still checked."
           exit 0
         fi
+        # What the comment says, in this step's own log, where an agent that works on a failed check reads (gh run view
+        # --log-failed), and as one annotation. It reads no bot's comment it was not told to: on 2026-11-24 Claude Code's
+        # /ship watch found "no cause beyond a failed gate" here (proof-bench/ship-vs-check).
+        # The step runs under bash -e: a missing log (pr-comment stopped before it wrote one) must not change the exit.
+        # The log names files and tests as git allows them, a line break included, so it is printed with the runner's
+        # commands stopped: a line in it that begins with :: is text, not a command (second read of 0.2.8).
+        say(){ local tok; tok="sawbuck$( (od -An -N16 -tx1 /dev/urandom | tr -d ' \n') 2>/dev/null || true)$(date +%s%N)$RANDOM"; echo "::stop-commands::$tok"; cat "$RUNNER_TEMP/promptwheel.log" 2>/dev/null || true; echo "::$tok::"; }
+        esc(){ local m; m=$(head -n 12 "$RUNNER_TEMP/promptwheel.log" 2>/dev/null); m=${m//'%'/'%25'}; m=${m//$'\r'/'%0D'}; m=${m//$'\n'/'%0A'}; printf '%s' "${m:-exit $GATE_EXIT}"; }
         if [ "$COMMENT_ONLY" = true ]; then
-          [ "$GATE_EXIT" = 0 ] || echo "::warning::Sawbuck is in comment-only mode here, so the job passes. With comment-only off this pull request would have been sent back (exit $GATE_EXIT)."
+          if [ "$GATE_EXIT" != 0 ]; then
+            say
+            echo "::warning title=Sawbuck would have sent this back::$(esc)"
+            echo "::warning::Sawbuck is in comment-only mode here, so the job passes. With comment-only off this pull request would have been sent back (exit $GATE_EXIT)."
+          fi
           exit 0
+        fi
+        if [ "$GATE_EXIT" != 0 ]; then
+          say
+          echo "::error title=Sawbuck sent this back::$(esc)"
         fi
         exit "$GATE_EXIT"

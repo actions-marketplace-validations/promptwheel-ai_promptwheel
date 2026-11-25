@@ -160,13 +160,13 @@ function resolveConfig(p, repo, seen) {
       const base = resolveConfig(bp, repo, seen);
       for (const m of base.metrics) byName.set(m.name, m);
       for (const md of (base.mandates || [])) if (md && md.name) mandatesByName.set(md.name, md);
-      for (const k of ['repeat', 'linkNodeModules', 'linkDirs', 'env', 'setup', 'gamingThreshold', 'evaluatorPaths', 'allowTrailer', 'allowFromAuthor']) if (base[k] !== undefined) scalars[k] = base[k];
+      for (const k of ['repeat', 'linkNodeModules', 'linkDirs', 'env', 'setup', 'gamingThreshold', 'evaluatorPaths', 'allowTrailer', 'allowFromAuthor', 'testRewrites']) if (base[k] !== undefined) scalars[k] = base[k];
     }
     for (const m of (cfg.metrics || [])) {
       byName.set(m.name, m);
     }
     for (const md of (cfg.mandates || [])) if (md && md.name) mandatesByName.set(md.name, md);
-    for (const k of ['repeat', 'linkNodeModules', 'linkDirs', 'env', 'setup', 'gamingThreshold', 'evaluatorPaths', 'allowTrailer', 'allowFromAuthor']) if (cfg[k] !== undefined) scalars[k] = cfg[k];
+    for (const k of ['repeat', 'linkNodeModules', 'linkDirs', 'env', 'setup', 'gamingThreshold', 'evaluatorPaths', 'allowTrailer', 'allowFromAuthor', 'testRewrites']) if (cfg[k] !== undefined) scalars[k] = cfg[k];
     return { ...scalars, metrics: [...byName.values()], mandates: [...mandatesByName.values()] };
   } finally {
     seen.delete(abs); // only ACTIVE ancestors are a cycle, a diamond (a base reached two ways) is fine
@@ -406,7 +406,9 @@ function measureAt(repo, ref, cfg, repeat) {
 // installed node_modules) is not in the key, so a caller that changes it empties the folder.
 function measureBase(repo, base, cfg, repeat, dir) {
   if (!dir) return { samples: measureAt(repo, base, cfg, repeat) };
-  const abs = resolve(dir), inRepo = relative(realpathSync(repo), abs);
+  // the folder by its real path, as far as it exists yet: a folder inside the repo named through a symlink is inside (lead L64)
+  const realish = (x) => { const tail = []; let a = resolve(x); for (;;) { try { return join(realpathSync(a), ...tail); } catch { const up = dirname(a); if (up === a) return resolve(x); tail.unshift(basename(a)); a = up; } } };
+  const abs = resolve(dir), inRepo = relative(realpathSync(repo), realish(abs));
   if (!inRepo.startsWith('..') && !isAbsolute(inRepo)) bad(`promptwheel: --base-cache needs a folder outside the repository (got ${dir}): a kept number the change can reach is a goalpost`);
   const how = [git(['rev-parse', `${base}^{tree}`], repo), cfg.metrics.map((m) => [m.name, m.cmd ?? null, m.extract ?? 'number', m.allowNonzero === true, m.timeoutSec ?? null]), measuredWith(cfg), repeat, TOOL_VERSION, process.platform];
   const file = join(abs, `${createHash('sha256').update(JSON.stringify(how)).digest('hex').slice(0, 32)}.json`);
@@ -824,14 +826,17 @@ function selfHeal(repo) {
         .split('\n').filter((l) => l.startsWith('worktree ')).map((l) => l.slice(9).trim()),
     );
     const tmp = tmpBase(repo), now = Date.now(), mine = tmpOwnerTag(repo);
+    // git lists a worktree by its real path; the temp folder may sit behind a symlink (on a Mac /var is /private/var), and
+    // a registered worktree named through the link was taken for one a killed run left behind (lead L64)
+    const real = (x) => { try { return realpathSync(x); } catch { return x; } };
     for (const name of readdirSync(tmp)) {
       const made = ENGINE_TMP.exec(name);
       if (!made) continue;   // not a name this engine generates (worktrees + temp-index dirs): never removed
       const tag = made[2];
       // ours after an hour; another repo's only after a full day
-      const p = join(tmp, name);
-      if (tracked.has(p) && tag !== mine) continue;   // a registered worktree this repo's gate did not make
-      const maxAge = tag === mine && !tracked.has(p) ? 3600_000 : 86_400_000;
+      const p = join(tmp, name), registered = tracked.has(p) || tracked.has(real(p));
+      if (registered && tag !== mine) continue;   // a registered worktree this repo's gate did not make
+      const maxAge = tag === mine && !registered ? 3600_000 : 86_400_000;
       // lstat: the engine makes directories, so a file or a symlink under one of its names is left alone
       try { const st = lstatSync(p); if (st.isDirectory() && st.mtimeMs < now - maxAge) rmSync(p, { recursive: true, force: true }); } catch { /* */ }
     }
@@ -867,7 +872,7 @@ function warnEditableInstall(repo) {
 // guarded metric in the very diff it "passes". We resolve the gate as of BASE too and, if a
 // guard was dropped, re-measure it under its BASE definition; the pass only reads GAMED when
 // that guard WOULD HAVE FAILED at head (a real regression hidden by moving the goalposts).
-const GATE_SCALARS = ['gamingThreshold', 'evaluatorPaths', 'allowTrailer', 'allowFromAuthor', 'setup', 'env', 'linkDirs', 'linkNodeModules'];
+const GATE_SCALARS = ['gamingThreshold', 'evaluatorPaths', 'allowTrailer', 'allowFromAuthor', 'setup', 'env', 'linkDirs', 'linkNodeModules', 'testRewrites'];
 // what runs or shapes every measurement besides the metric's own command. A setup can rewrite a test and an
 // env var can skip one, so these are part of the gate: fingerprinted, and held at their base values for the
 // change that edits them (see detectGamingPass).
@@ -1022,7 +1027,7 @@ function gateWeakenings(baseGate, headMetrics) {
 // A reason names a thing when the thing's name stands in it as a whole word, in any case (`mandate:` is optional).
 // The checks that are about the tests themselves are ONE thing to a reason: deleting a test moves the green, the count
 // of tests and the count of assertions in one act, and a person who accepts that act has accepted all three.
-const TEST_KIND = new Set(['tests_pass', 'test_count', 'skipped_tests', 'assertions']);
+const TEST_KIND = new Set(['tests_pass', 'test_count', 'skipped_tests', 'assertions', 'tests_taken_out', 'tests_rewritten']);
 const kindOf = (label) => (TEST_KIND.has(label) ? 'the tests' : label);
 const kindsIn = (labels) => new Set([...labels].map(kindOf)).size;
 const reasonNames = (reason, label) => new RegExp(`(^|[^A-Za-z0-9_-])${label.replace(/^mandate:/, '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}($|[^A-Za-z0-9_-])`, 'i').test(reason);
@@ -1453,6 +1458,26 @@ function gateInner(repo, opts) {
   // - an allowable mandate (the lock file, the contract, the hooks), by the flag only.
   // Never implicit: without a reason each of these fails as usual, and the reason is recorded.
   const mode = new Map((cfg.metrics || []).filter((c) => c && c.allowable && c.name).map((c) => [c.name, c.allowable]));
+  // ON A PULL REQUEST (the action says so: --pull-request), every test an earlier commit of the change added, gone at its
+  // head, is a guard of its own, let through by a person's reason as the counts are (0.8.20). Off a pull request it stays
+  // the note it was: it spoke on none of 128 fresh controls nobody had looked at, and on 14 of 139 objected ones.
+  const takenOutRead = opts.working ? null : testsTakenOut(repo, changeSteps(repo, base, head));
+  const takenOutEarly = opts.pullRequest ? takenOutRead : null;
+  if (takenOutEarly) {
+    metrics.push({ name: 'tests_taken_out', direction: 'up', guard: true, ok: false, status: 'regressed', before: takenOutEarly.added, after: 0, delta: -takenOutEarly.added, noise: 0, confidence: 'high', tripwire: true, gamingCheck: false, takenOut: takenOutEarly });
+    mode.set('tests_taken_out', 'flag');
+  }
+  // ON A PULL REQUEST, a test the base had, rewritten after an earlier commit changed the source, with the base's tests
+  // failing on the new source (testsRewrittenAfter): a note; where the contract says "testRewrites": "ask" (the base's
+  // contract or the change's, the stricter), a guard of its own, let through by a person's reason as the counts are.
+  const rewritten = opts.pullRequest && !opts.working && metrics.some((m) => m.heldByTestEdit)
+    ? testsRewrittenAfter(repo, changeStepsAll(repo, base, head), (a, b) => changedSourcePaths(repo, a, b, evaluatorMatcher(cfg), { metrics: [...(cfg.metrics || []), ...(baseGate ? [...baseGate.metrics.values()] : [])] }), (f) => TEST_PATH.test(f) || evaluatorMatcher(cfg)(f))
+    : null;
+  const askRewrites = rewritten && [cfg.testRewrites, (() => { try { return ((gateDefAtRef(repo, base) || {}).scalars || {}).testRewrites; } catch { return undefined; } })()].includes('ask');
+  if (askRewrites) {
+    metrics.push({ name: 'tests_rewritten', direction: 'up', guard: true, ok: false, status: 'regressed', before: rewritten.tests.length + rewritten.more, after: 0, delta: -(rewritten.tests.length + rewritten.more), noise: 0, confidence: 'high', tripwire: true, gamingCheck: false, rewritten });
+    mode.set('tests_rewritten', 'flag');
+  }
   const gm = opts.detectGaming ? metrics.filter((m) => m.gamed === true) : [];
   const up = opts.detectGaming ? metrics.filter((m) => m.unprovable === true) : [];
   const gw = !!(opts.detectGaming && gateInfo && gateInfo.weakened);
@@ -1492,8 +1517,11 @@ function gateInner(repo, opts) {
     if (change) for (const m of fell) { const w = change.has(m.name) && fellIn(change.get(m.name), defOf(m.name)); if (w) m.where = w; }
     if (change) for (const m of held) { const w = change.has(m.name) && lostInFiles(repo, base, head, change.get(m.name), defOf(m.name), seen); if (w) m.lostIn = w; }
   }
-  // tests an earlier commit of this change added, all gone at its head (testsTakenOut): a note, never part of the verdict
-  const takenOut = opts.working ? null : testsTakenOut(repo, changeSteps(repo, base, head));
+  // tests an earlier commit of this change added, all gone at its head (testsTakenOut): a note, never part of the verdict,
+  // except on a pull request, where it is the guard tests_taken_out (above)
+  const takenOut = takenOutRead;
+  // two or more named tests gone, or a file that stays lost every test (testsGone): a note, never part of the verdict
+  const goneByName = opts.working ? null : testsGone(repo, base, head);
   const byCommit = opts.working || trailersOff() ? [] : guards.filter((m) => !m.allowed && mode.get(m.name) === true).map((m) => m.name);
   const mandated = mandateViolations.length > 0;
   const verdict = deriveVerdict(metrics, gateInfo, mandated);
@@ -1513,6 +1541,8 @@ function gateInner(repo, opts) {
     ...(allowable.length ? { allowable } : {}),
     ...(byCommit.length ? { byCommit } : {}),
     ...(takenOut ? { testsTakenOut: takenOut } : {}),
+    ...(rewritten ? { testsRewritten: rewritten } : {}),
+    ...(goneByName ? { testsGone: goneByName } : {}),
     ...(Array.isArray(cfg.mandates) && cfg.mandates.length ? { protects: cfg.mandates.length } : {}),
     // a repo with one person in it: the contract at the base says the account that opened a pull request may let it
     // through, so the words about who can accept a change say that (read at the base, like pr-allow does)
@@ -1540,7 +1570,7 @@ function run(argv) {
     config = autoConfig(repo);
     console.error(`no promptwheel.config.json, auto-gating the detected test command: ${config.metrics[0].cmd}  (promptwheel init to customize; --no-auto to require a config)`);
   }
-  const report = gate(repo, { base: args.base, head: args.head, working: args.working, repeat: args.repeat, detectGaming: args.detectGaming, allow: args.allow, config, baseCache: args.baseCache });
+  const report = gate(repo, { base: args.base, head: args.head, working: args.working, repeat: args.repeat, detectGaming: args.detectGaming, allow: args.allow, config, baseCache: args.baseCache, pullRequest: !!args.pullRequest });
   // one short row in the record (the git folder, never the tree), unless --no-record. The report is not changed by it.
   if (!args.noRecord) recordRun(repo, report, config ?? loadConfig(repo), { label: args.label });
   if (args.json) console.log(JSON.stringify(report, null, 2));
@@ -1740,7 +1770,7 @@ function insights(argv) {
   const over = attempts.filter((r) => typeof r.turns === 'number');
   const overTurns = over.length ? { runs: over.length, kept: over.filter((r) => r.result === 'kept').length, bestTurns: over.filter((r) => r.result === 'kept' && typeof r.best === 'number').map((r) => r.best) } : null;
   if (args.json) { console.log(JSON.stringify({ runs: runs.length, attempts: attempts.length, kept, ...(overTurns ? { overTurns } : {}), metrics: rows }, null, 2)); return; }
-  console.log(`\nPromptWheel insights, ${runs.length} checked runs in the record${attempts.length ? ` (${attempts.length} attempts of the loop, ${kept} kept)` : ''}\n`);
+  console.log(`\nPromptWheel insights, ${runs.length} checked run${runs.length === 1 ? '' : 's'} in the record${attempts.length ? ` (${attempts.length} attempts of the loop, ${kept} kept)` : ''}\n`);
   console.log(`  ${'measure'.padEnd(26)} ${'runs'.padStart(5)} ${'up'.padStart(5)} ${'worse'.padStart(5)} ${'unsure'.padStart(6)} ${'net'.padStart(9)}  lever`);
   for (const r of rows) console.log(`  ${oneLine(r.name, 26).padEnd(26)} ${String(r.runs).padStart(5)} ${String(r.improved).padStart(5)} ${String(r.regressed).padStart(5)} ${String(r.inconclusive).padStart(6)} ${String(r.net).padStart(9)}  ${(r.lever * 100).toFixed(0)}%`);
   console.log('\n  lever = runs that made the measure better, out of all runs. It says where a change has paid here before.');
@@ -1872,7 +1902,7 @@ function playbook(argv) {
   const suff = entries.filter((e) => e.sufficient);
   const pct = (x) => `${Math.round(x * 100)}%`;
   const out = [];
-  out.push(`## What the record shows here (${runs.length} checked runs; a run counts half as much every ${HALF_LIFE} runs)`);
+  out.push(`## What the record shows here (${runs.length} checked run${runs.length === 1 ? '' : 's'}; a run counts half as much every ${HALF_LIFE} runs)`);
   out.push('Every line below was measured by the check. Nothing here is a guess, and a line fades unless new runs earn it again.', '');
   if (!suff.length) out.push(`_Nothing has earned a line yet. A key needs ${MIN_MOVED} weighted runs in which it moved. ${entries.length} keys are being counted._`);
   else {
@@ -1906,7 +1936,7 @@ function suggest(argv) {
   const stalled = attempts.length >= STALL_W && attempts.slice(-STALL_W).every((r) => r.result !== 'kept');
   const leastTried = stalled && arms.length ? [...arms].sort((a, b) => a.w - b.w)[0].key : null;
   if (args.json) { console.log(JSON.stringify({ runs: runs.length, thin: runs.length < 10, stalled, ...(leastTried ? { leastTried } : {}), retired, arms: arms.slice(0, 10) }, null, 2)); return; }
-  console.log(`\nPromptWheel suggest, over ${runs.length} checked runs${runs.length < 10 ? '  (a thin record: mostly a guess, the bonus for what is untried decides)' : ''}\n`);
+  console.log(`\nPromptWheel suggest, over ${runs.length} checked run${runs.length === 1 ? '' : 's'}${runs.length < 10 ? '  (a thin record: mostly a guess, the bonus for what is untried decides)' : ''}\n`);
   if (stalled) console.log(`  The last ${STALL_W} attempts kept nothing. Try what the record has seen least: ${leastTried}\n`);
   for (const a of arms.slice(0, 5)) console.log(`  ${a.ucb.toFixed(3)}  ${a.key.padEnd(28)} lever ${a.lever.toFixed(3)} (helped ${a.p}, moved ${a.move}) · moved in ${a.moved.toFixed(1)} of ${a.n} runs${a.sufficient ? '' : ' · too few to earn a line'}`);
   if (!arms.length) console.log('  (nothing in the record yet that an attempt could improve: every measure is gone from the contract, already passes, or is a count that more of alone is not a win)');
@@ -2186,6 +2216,8 @@ function printHuman(r) {
   }
   for (const m of r.metrics || []) for (const w of m.lostIn || []) console.log(`  ℹ note: ${w.file} has ${PLAIN[m.name] || m.name} (${w.before} → ${w.after}), though the repo's total did not fall`);
   if (r.testsTakenOut) console.log(`  ℹ note: ${takenOutSaid(r.testsTakenOut, false)}`);
+  if (r.testsRewritten && !r.metrics.some((m) => m.name === 'tests_rewritten')) console.log(`  ℹ note: ${rewrittenSaid(r.testsRewritten, false)}`);
+  if (r.testsGone) console.log(`  ℹ note: ${goneSaid(r.testsGone, false)}`);
   for (const x of r.explained || []) if (x.metric === 'environment') console.log(`  ℹ note: ${x.what}: ${x.items.join(', ')}`);
   if (r.setup) { const at = Object.keys(r.setup), f = r.setup[at[0]]; console.log(`  ⚠ setup failed (exit ${f.exit}) at the ${at.join(' and ')} ref${at.length > 1 ? 's' : ''}${f.lastLine ? ': ' + f.lastLine : ''}`); }
   if (r.gate && r.gate.weakened) for (const w of r.gate.weakened) console.log(w.change === 'measurement-edited'
@@ -2221,7 +2253,7 @@ const allowFlag = (r) => `--allow "${allowNames(r)}<reason>"`;
 const PLAIN = {
   lifecycle_scripts: 'a new install script', dependency_entries: 'a new dependency', lock_nonregistry_sources: 'a dependency from outside the registry',
   unpinned_execution: 'something that runs without a pinned version', install_policy_gaps: 'a weaker install policy', lock_drift: 'the shape of the repo changed',
-  pins_changed: 'resolved dependency versions changed', tests_pass: 'tests stopped passing', test_count: 'fewer tests', skipped_tests: 'more skipped tests',
+  pins_changed: 'resolved dependency versions changed', tests_pass: 'tests stopped passing', test_count: 'fewer tests', skipped_tests: 'more skipped tests', tests_taken_out: 'tests this change added and then took out', tests_rewritten: 'a test the base had, rewritten after the source changed',
   suppressions: 'more silenced checks', assertions: 'fewer assertions',
 };
 // What the measurement borrows from the machine it runs on and no diff shows: a variable that can change which tests
@@ -2245,7 +2277,7 @@ function explainMetrics(repo, metrics) {
   if (hit.some((m) => m.name === 'lock_drift')) {
     try { items = JSON.parse(execFileSync(process.execPath, ['.promptwheel/packs/supply-chain/lock.mjs', 'drift', '.', '--json'], { cwd: repo, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })).slice(0, 8); } catch { /* words without the list */ }
   }
-  return hit.map((m) => ({ metric: m.name, noted: !!m.noted, what: PLAIN[m.name] || m.name, ...(m.name === 'lock_drift' && items.length ? { items } : {}), ...(m.allowable ? { allowable: true } : {}) }));
+  return hit.map((m) => ({ metric: m.name, noted: !!m.noted, what: (m.name === 'tests_taken_out' && m.takenOut) ? takenOutSaid(m.takenOut, true) : (m.name === 'tests_rewritten' && m.rewritten) ? rewrittenSaid(m.rewritten, true) : (PLAIN[m.name] || m.name), ...(m.name === 'lock_drift' && items.length ? { items } : {}), ...(m.allowable ? { allowable: true } : {}) }));
 }
 // A reason a person left on a pull request. The newest `sawbuck-allow: <reason>` comment from someone with write
 // access wins. A bot never counts. Since 0.8.10 neither does the account that opened the pull request (`author`),
@@ -2333,10 +2365,16 @@ function mdPathWayOut(r) {
 // In the comment: "an earlier commit of this pull request (`abc1234`) added 3 tests. None of them is in it now: `a`, `b`, `c`."
 // With one: "... added 1 test. That test is not in it now: `a`." (the owner's yes to these words, 2026-11-22)
 // At a terminal the same, of "this change": a range of commits is not always a pull request.
+// the words he approved on 2026-11-23 (the next reading's note): what was read, not what it means
+const goneSaid = (t, md) => `${t.gone} test${t.gone === 1 ? ' that was' : 's that were'} named in the changed files ${t.gone === 1 ? 'is' : 'are'} not named in them now: ${takenOutNames(t, md ? '`' : '')}. A rename reads the same way.`;
 const takenOutNames = (t, q = '') => `${t.names.map((n) => q + n + q).join(', ')}${t.more ? ` and ${t.more} more` : ''}`;
 const takenOutSaid = (t, md) => md
   ? `an earlier commit of this pull request (\`${t.at}\`) added ${t.added} test${t.added === 1 ? '' : 's'}. ${t.added === 1 ? 'That test is not' : 'None of them is'} in it now: ${takenOutNames(t, '`')}.`
   : `an earlier commit of this change (${t.at}) added ${t.added} test${t.added === 1 ? '' : 's'}, and ${t.added === 1 ? 'that test is not' : 'none of them is'} in it now: ${takenOutNames(t)}`;
+const rewrittenNames = (t, q = '') => t.tests.map((n) => `${q}${n}${q}`).join(', ') + (t.more ? ` and ${t.more} more` : '');
+const rewrittenSaid = (t, md) => md
+  ? `a later commit of this pull request (\`${t.at}\`) rewrote a test the base branch had, after an earlier commit (\`${t.after}\`) changed the source, and the base branch's tests fail on this pull request's source: ${rewrittenNames(t, '`')}.`
+  : `a later commit of this pull request (${t.at}) rewrote a test the base branch had, after an earlier commit (${t.after}) changed the source, and the base branch's tests fail on this pull request's source: ${rewrittenNames(t)}`;
 function renderMarkdown(r, o = {}) {
   const sIcon = { improved: '🟢', regressed: '🔴', unchanged: '⚪', inconclusive: '🟡', unmeasurable: '⚫' };
   const rows = r.metrics.map((m) => {
@@ -2375,7 +2413,9 @@ function renderMarkdown(r, o = {}) {
     ...(r.allowed && (r.allowable || []).some((l) => !r.allowed.cleared.includes(l)) ? [`> ✋ **Not let through:** \`${r.allowable.filter((l) => !r.allowed.cleared.includes(l)).join('`, `')}\`. A reason lets through only what it names when there is more than one thing. ${mdAccept(r, true)}`] : []),
     ...(r.gate && r.gate.changed ? [`> ⚠ **Gate definition changed** in this diff (fingerprint \`${r.gate.fingerprint.base}\` -> \`${r.gate.fingerprint.head}\`): a metric, guard, evaluatorPath, mandate, or the setup, env or linked dirs they are measured with was added, removed or edited. Review the config change with the code.`] : []),
     ...(lost.length ? [lost.join('\n')] : []),
-    ...(r.testsTakenOut ? [`> ℹ️ **Note:** ${takenOutSaid(r.testsTakenOut, true)}`] : []),
+    ...(r.testsTakenOut && !r.metrics.some((m) => m.name === 'tests_taken_out') ? [`> ℹ️ **Note:** ${takenOutSaid(r.testsTakenOut, true)}`] : []),
+    ...(r.testsRewritten && !r.metrics.some((m) => m.name === 'tests_rewritten') ? [`> ℹ️ **Note:** ${rewrittenSaid(r.testsRewritten, true)}`] : []),
+    ...(r.testsGone ? [`> ℹ️ **Note:** ${goneSaid(r.testsGone, true)}`] : []),   // on a pull request it is a line that needs a look instead
     ...(o.note && String(o.note).trim() ? [String(o.note).trim()] : []),
     o.fold === false ? `\`${span}\`${rest}\n\n${table}` : `<details><summary>What was measured (<code>${span}</code>${rest})</summary>\n\n${table}\n\n</details>`,
     MD_FOOT,
@@ -2593,14 +2633,16 @@ export function testsIn(path, text) {
 // common shape (proof-bench/outside-repos, 2026-11-19: 29 of 45).
 // So the change's own commits are read, each against the base, for the tests it ADDS there by name. When an earlier
 // commit added some and the last adds none, the report says so and names them (`testsTakenOut`). A note for a reader,
-// never part of a verdict. Scored on 994 pull requests (proof-bench/per-test/RESULT.md): it speaks on 14 of 139 pull
+// never part of a verdict, except on a pull request (0.8.20: the guard tests_taken_out, in gate()). Scored on 994 pull requests (proof-bench/per-test/RESULT.md): it speaks on 14 of 139 pull
 // requests a person objected to, 6 of 270 matched ones nobody objected to, and none of 271 ordinary ones by an agent.
 // The trigger is the NUMBER of tests added, not their names: a rename is a name gone, and by name alone half of what
 // this spoke on among controls was a rename. Wider forms (half or fewer left) spoke on too much unobjected work.
 // It reads at most the last 60 of the change's commits, and says nothing when a step touches more than 2,000 files it
 // can read or a commit is not in the clone (a shallow one). Blobs are read from the object store; nothing is checked out.
 const TESTS_READ_COMMITS = 60, TESTS_READ_FILES = 2000, TESTS_READ_BLOB = 2 * 1024 * 1024;
-function testsAddedAt(repo, base, head, cache) {
+// a path that names a test file in the usual ways: a tests folder, or a test or spec file of its language
+const TEST_PATH = /(^|\/)(tests?|__tests__|specs?)\/|(^|\/)test_[^/]*\.py$|_test\.(go|py|rb|exs?)$|\.(test|spec)\.[cm]?[jt]sx?$|(Tests?|Specs?)\.(java|kt|cs|swift|scala)$|_spec\.rb$/i;
+function testsAddedAt(repo, base, head, cache, out = null) {
   // the tests `head` adds over `base`, by name: Map name -> how many more of it. null: this step cannot be read.
   const g = (args, input) => execFileSync('git', args, { cwd: repo, input, maxBuffer: 1 << 30, stdio: ['pipe', 'pipe', 'ignore'] });
   let parts; try { parts = g(['diff', '--name-status', '-z', '--no-renames', base, head, '--']).toString('utf8').split('\0'); } catch { return null; }
@@ -2611,7 +2653,11 @@ function testsAddedAt(repo, base, head, cache) {
   const asks = []; for (const c of changed) { if (c.st !== 'A') asks.push([c, 'a', `${base}:${c.f}`]); if (c.st !== 'D') asks.push([c, 'b', `${head}:${c.f}`]); }
   let chk; try { chk = g(['cat-file', '--batch-check=%(objectname) %(objecttype) %(objectsize)'], asks.map((a) => a[2]).join('\n') + '\n').toString('utf8').split('\n'); } catch { return null; }
   const want = new Map();
-  asks.forEach((a, i) => { const m = /^([0-9a-f]{40,64}) blob (\d+)$/.exec(chk[i] || ''); if (m && +m[2] <= TESTS_READ_BLOB) { a[0][a[1]] = `${m[1]}.${testExt(a[0].f)}`; if (!cache.has(a[0][a[1]])) want.set(a[0][a[1]], [m[1], a[0].f]); } });
+  // a side that is not a blob this reads (too big, or not in the clone, or a name git gives in bytes that are not UTF-8):
+  // where the file is a test file, the step cannot be read and the notes say nothing (below). Read as empty, its tests all
+  // read as gone or all as new (second read of 0.2.7); left out of the tally, tests moved out of it and back read as
+  // added and taken out (the re-read): neither is a reading.
+  asks.forEach((a, i) => { const m = /^([0-9a-f]{40,64}) blob (\d+)$/.exec(chk[i] || ''); if (!(m && +m[2] <= TESTS_READ_BLOB)) a[0].unread = true; if (m && +m[2] <= TESTS_READ_BLOB) { a[0][a[1]] = `${m[1]}.${testExt(a[0].f)}`; if (!cache.has(a[0][a[1]])) want.set(a[0][a[1]], [m[1], a[0].f]); } });
   const todo = [...want.entries()];
   for (let i = 0; i < todo.length; i += 500) {
     const part = todo.slice(i, i + 500); let out; try { out = g(['cat-file', '--batch'], part.map(([, [sha]]) => sha).join('\n') + '\n'); } catch { return null; }
@@ -2625,10 +2671,80 @@ function testsAddedAt(repo, base, head, cache) {
     }
   }
   const tally = new Map(); const bump = (n, by) => tally.set(n, (tally.get(n) || 0) + by);
+  // only a test file not read silences the notes: by its path, or by the tests its readable side holds. Any other file not
+  // read holds no tests, as before 0.8.20: a built bundle past 2 MiB silenced them otherwise (last look at 0.2.7).
+  const holds = (c) => ((c.a && cache.get(c.a)) || []).length + ((c.b && cache.get(c.b)) || []).length;
+  if (changed.some((c) => c.unread && (TEST_PATH.test(c.f) || holds(c) > 0))) return null;
   for (const c of changed) { for (const n of (c.b && cache.get(c.b)) || []) bump(n, 1); for (const n of (c.a && cache.get(c.a)) || []) bump(n, -1); }
+  if (out) { out.changed = changed; out.tally = tally; }   // testsGone reads the whole tally and each file
   return new Map([...tally].filter(([, v]) => v > 0));   // a test that moved to another changed file keeps its name and cancels
 }
+// TWO OR MORE NAMED TESTS GONE, OR A FILE THAT STAYS LOST EVERY TEST (0.8.20, the reading R1(c) of
+// proof-bench/per-test): over the files the change touched, the names its base holds and its head no longer does (a test
+// that moved to another changed file keeps its name), when there are two or more of them, or when a file that stays had
+// a test and has none. On 128 fresh controls nobody had looked at it spoke on 6, and five of those were renames or
+// rewrites: so it is a note that says what was read, never part of a verdict. -> { gone, names, more, emptied } | null
+// The change is read from the point it left the base (the last of changeStepsAll), as the benchmark's rows were read:
+// a base that moved on since does not read as tests the change took out. A clone too shallow to find that point gets
+// no note.
+export function testsGone(repo, base, head) {
+  const all = changeStepsAll(repo, base, head); if (!all || !all.length) return null;
+  const span = all[all.length - 1];
+  return testsGoneIn(repo, span.base, span.head);
+}
+// the reading over one span, from -> to (exported for the benchmark's sealed harness, whose clones are shallow)
+export function testsGoneIn(repo, from, to) {
+  const cache = new Map(), out = {};
+  if (testsAddedAt(repo, from, to, cache, out) === null || !out.tally) return null;
+  const gone = [...out.tally].filter(([, v]) => v < 0);
+  const n = gone.reduce((a, [, v]) => a - v, 0);
+  const emptied = (out.changed || []).filter((c) => c.st !== 'D' && c.a && c.b && (cache.get(c.a) || []).length >= 1 && (cache.get(c.b) || []).length === 0).map((c) => c.f).sort();
+  // two or more gone, or one gone with a file that lost every test; a file emptied by tests that moved to another changed
+  // file has nothing gone, and says nothing (second read of 0.2.7: it printed "0 tests ...: .")
+  if (n < 2 && !(n >= 1 && emptied.length)) return null;
+  const names = gone.map(([k]) => k).sort();
+  return { gone: n, names: names.slice(0, 10), more: Math.max(0, names.length - 10), emptied };
+}
 // steps: [{ base, head }] in order, the last one the change as it stands. -> { added, names, more, at } | null
+// ON A PULL REQUEST: the tests the base had that a later commit of the change rewrote, after an earlier commit changed
+// the source and left them as they were (proof-bench/ship-vs-check, 2026-11-24: the person's commit broke a test, the
+// agent's next commit rewrote it to the new result, and over the whole change it read green to green, so the check
+// passed it). The gate speaks only where the base's tests also fail on the new source (heldByTestEdit). Measured first
+// (proof-bench/ship-vs-check/gap-a): the steps alone match 95 of 198 pull requests a reviewer objected to and 98 of 388
+// controls from the same repos, which is why it is a note unless the contract asks ("testRewrites": "ask").
+// steps: [{ base, head }] oldest first; split(a, b) -> { source, nonSource }; isTest(path). -> { tests, more, at, after } | null
+export function testsRewrittenAfter(repo, steps, split, isTest = (f) => TEST_PATH.test(f)) {
+  // Capped like the readers above (second read of 0.2.8: uncapped, it took 157 s where 0.8.20 took 6 on a pull request
+  // of 100 commits that rewrote 3,000 test files): at most 60 commits and 2,000 names a step, names read once a commit,
+  // and the engine's own source split asked only of a commit before a rewrite, once each.
+  if (!Array.isArray(steps) || steps.length < 2 || steps.length > TESTS_READ_COMMITS || typeof split !== 'function') return null;
+  try {
+    const statuses = (a, b) => {   // path -> status letter, read with -z as the readers above read names; null over the cap
+      const parts = execFileSync('git', ['diff', '--name-status', '-z', '--no-renames', a, b, '--'], { cwd: repo, maxBuffer: 1 << 30, stdio: ['ignore', 'pipe', 'ignore'] }).toString('utf8').split('\0');
+      const m = new Map(); for (let i = 0; i + 1 < parts.length; i += 2) m.set(parts[i + 1], parts[i][0]);
+      return m.size > TESTS_READ_FILES ? null : m;
+    };
+    const net = statuses(steps[0].base, steps[steps.length - 1].head); if (!net) return null;
+    // a test the base had and the head still has: modified over the whole change (a rename reads as one gone and one new)
+    const had = [...net].filter(([f, st]) => st === 'M' && isTest(f)).map(([f]) => f);
+    if (!had.length) return null;
+    const per = []; for (const st of steps) { const m = statuses(st.base, st.head); if (!m) return null; per.push(m); }
+    // a commit changed the source: not where it named only tests, else as the engine's own split says, asked once a commit
+    const named = per.map((m) => [...m.keys()].some((f) => !isTest(f)));
+    const src = new Map();
+    const changedSource = (i) => { if (!named[i]) return false; if (!src.has(i)) { const x = split(steps[i].base, steps[i].head); src.set(i, !!(x && x.source.length)); } return src.get(i); };
+    const hits = [];
+    for (const t of had) {
+      const first = per.findIndex((m) => m.has(t));
+      if (first < 1) continue;
+      let j = -1; for (let i = 0; i < first; i++) if (changedSource(i)) { j = i; break; }
+      if (j >= 0) hits.push({ t, at: steps[first].head, after: steps[j].head });
+    }
+    if (!hits.length) return null;
+    const tests = hits.map((h) => h.t).sort();
+    return { tests: tests.slice(0, 10), more: Math.max(0, tests.length - 10), at: short(repo, hits[0].at), after: short(repo, hits[0].after) };
+  } catch { return null; }   // a commit git cannot read (a damaged or partial clone): no note, never a failed run
+}
 export function testsTakenOut(repo, steps) {
   if (!Array.isArray(steps) || steps.length < 2) return null;
   const cache = new Map(); let most = null, at = null;
@@ -2646,16 +2762,19 @@ export function testsTakenOut(repo, steps) {
 // request (its checkout is a merge of the head into the base) the commits are those of the second parent. A branch that
 // took the base in again is held, from that commit on, against the point where it then left the base.
 function changeSteps(repo, base, head) {
+  const all = changeStepsAll(repo, base, head);
+  return all && all.length >= 2 ? all.slice(-TESTS_READ_COMMITS) : null;
+}
+function changeStepsAll(repo, base, head) {
   const g = (...a) => { try { return execFileSync('git', a, { cwd: repo, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { return null; } };
   const b = g('rev-parse', '--verify', '--quiet', `${base}^{commit}`), h = g('rev-parse', '--verify', '--quiet', `${head}^{commit}`); if (!b || !h) return null;
   const ps = (g('rev-list', '--parents', '-n', '1', h, '--') || '').split(' ');
   const tip = ps.length === 3 && ps[1] === b ? ps[2] : h;
   const fork = g('merge-base', b, tip); if (!fork) return null;
   const list = (g('rev-list', '--first-parent', '--parents', '--reverse', `${fork}..${tip}`, '--') || '').split('\n').filter(Boolean).map((l) => l.split(' '));
-  if (list.length < 2) return null;
   let from = fork; const steps = [];
   for (const [c, ...parents] of list) { if (parents.length > 1) from = g('merge-base', b, c) || from; steps.push({ base: from, head: c }); }
-  return steps.slice(-TESTS_READ_COMMITS);
+  return steps;
 }
 
 // ---- The comment on a pull request: one, edited in place, and only when there is something to say -------------------
@@ -2671,9 +2790,30 @@ function changeSteps(repo, base, head) {
 // - A comment about an earlier push is never left standing on a push that passes: it is edited to one short line.
 // `commentOnly`: the job never fails, and the comment says what would have been sent back.
 // Pure: what to do is returned, and the Action's own shell does it. { action: 'none' | 'create' | 'update', id, body,
-// summary, wouldFail }.
+// summary, log, wouldFail }.
 const BOT = 'github-actions[bot]';
 const markerFor = (key) => `<!-- sawbuck-check: ${String(key || '').replace(/[^A-Za-z0-9 _.\/-]/g, '').replace(/\s+/g, ' ').trim().slice(0, 80) || 'check'} -->`;
+// The comment as plain text, for the log of the step that fails. An agent that works on a failed check reads that
+// check's log (`gh run view --log-failed`), not a bot's comment: on 2026-11-24 Claude Code's /ship watch read our
+// failed job and found "no cause beyond a failed gate" (proof-bench/ship-vs-check). No markup, only the measures that
+// moved, and the same words as the comment, the way through included.
+export function commentLog(md) {
+  const out = [];
+  for (const raw of String(md || '').split('\n')) {
+    const t = raw.trim();
+    if (/^<!--.*-->$/.test(t) || /^<sub>.*<\/sub>$/.test(t)) continue;          // the marker, the footer
+    if (/^\|[\s:|-]+\|$/.test(t)) continue;                                      // a table's rule line
+    let l = raw.replace(/<\/?(details|summary|code|sub|b|i)>|<br\s*\/?>/g, '').replace(/\*\*/g, '').replace(/^\s*#+\s+/, '').replace(/^\s*>\s?/, '');
+    l = l.replace(/^[\s\p{Extended_Pictographic}\uFE0F\u200D]+/u, '');
+    if (/^\|.*\|$/.test(l.trim())) {                                             // a table row: only what moved
+      if (/\bunchanged\b/.test(l)) continue;
+      l = '  ' + l.trim().slice(1, -1).split('|').map((c) => c.trim().replace(/^[\p{Extended_Pictographic}\uFE0F\u200D\s]+/u, '')).join('  ');
+    }
+    out.push(l);
+  }
+  return out.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
 export function commentPlan(input = {}) {
   const { report = null, error = '', comments = [], note = '' } = input;
   const exit = Number(input.exit) || 0, mode = String(input.comment ?? 'true'), commentOnly = input.commentOnly === true;
@@ -2691,21 +2831,22 @@ export function commentPlan(input = {}) {
     full = ['### ⚠️ Sawbuck: could not run', `Nothing was checked on this push${why ? ':' : '.'}`, ...(why ? [why] : []), ...(commentOnly ? ['This check only comments here. It never fails the job.'] : []), MD_FOOT].join('\n\n');
     speaks = true;
   } else {
-    speaks = wouldFail || !!(report.allowed && (report.allowed.cleared || []).length) || report.metrics.some((m) => m.lostIn && m.lostIn.length) || !!report.testsTakenOut || !!(report.gate && report.gate.changed);
+    speaks = wouldFail || !!(report.allowed && (report.allowed.cleared || []).length) || report.metrics.some((m) => m.lostIn && m.lostIn.length) || !!report.testsTakenOut || !!report.testsRewritten || !!report.testsGone || !!(report.gate && report.gate.changed);
     full = null;
   }
   const render = (fold) => (readable ? renderMarkdown(report, { fold, commentOnly, wouldFail, note: wouldFail ? note : '' }) : full);
   const summary = render(false);
-  if (mode === 'false') return { action: 'none', body: '', summary, wouldFail };
+  const log = wouldFail ? commentLog(summary) : '';   // for the step that fails (commentLog)
+  if (mode === 'false') return { action: 'none', body: '', summary, log, wouldFail };
   let text = '';
   if (speaks || mode === 'always') text = render(true);
   else if (mine) text = [`### ✅ Sawbuck: passes`, `Nothing to add on this push (\`${report.base} → ${report.head}\`). What this comment said about an earlier push is in its edit history.`, MD_FOOT].join('\n\n');
-  if (!text) return { action: 'none', body: '', summary, wouldFail };
+  if (!text) return { action: 'none', body: '', summary, log, wouldFail };
   // GitHub takes 65,536 characters in a comment and refuses a longer one whole: cut it, and say where the rest is
   if (text.length > 60000) text = `${text.slice(0, 60000)}\n\n(Cut short: the whole report is in the job summary.)`;
   const body = `${marker}\n${text}`;
-  if (mine && String(mine.body || '').trim() === body.trim()) return { action: 'none', body: '', summary, wouldFail };
-  return mine ? { action: 'update', id: mine.id, body, summary, wouldFail } : { action: 'create', body, summary, wouldFail };
+  if (mine && String(mine.body || '').trim() === body.trim()) return { action: 'none', body: '', summary, log, wouldFail };
+  return mine ? { action: 'update', id: mine.id, body, summary, log, wouldFail } : { action: 'create', body, summary, log, wouldFail };
 }
 
 function parseArgs(argv) {
@@ -2726,6 +2867,7 @@ function parseArgs(argv) {
     else if (argv[i] === '-n' || argv[i] === '--limit') a.n = parseInt(argv[++i], 10);
     else if (argv[i] === '--allow') a.allow = argv[++i];
     else if (argv[i] === '--detect-gaming') { a.detectGaming = true; a.dgExplicit = true; }
+    else if (argv[i] === '--pull-request') a.pullRequest = true;   // the action, on a pull request: tests a change added and took out send it back
     else if (argv[i] === '--no-detect-gaming') { a.detectGaming = false; a.dgExplicit = true; }
     else if (argv[i] === '--json') a.json = true;
     else if (argv[i] === '--markdown') a.markdown = true;
@@ -2809,6 +2951,7 @@ export function check(options = {}) {
     detectGaming: options.detectGaming ?? true,
     allow: options.allow,
     baseCache: options.baseCache,
+    pullRequest: !!options.pullRequest,
   });
   // the library writes no row unless asked: a caller that keeps its own record (Sawbuck) decides
   if (options.record === true) recordRun(repo, report, config ?? loadConfig(repo), { label: options.label });
@@ -2975,7 +3118,7 @@ export function conformsToContract(report) {
 // the next argument; anything not starting with `-` is positional. --no-record checks without adding a row
 // to the record (Sawbuck and some CI steps pass it). `improve` is not in the table: it is the loop step's, which
 // refuses a flag it does not know, and takes no --allow (a person lets a change through, not a loop).
-const GATE_FLAGS = ['--base', '--head', '--repeat', '--working', '--no-record', '--no-auto', '--allow', '--detect-gaming', '--no-detect-gaming', '--json', '--markdown', '--label', '--base-cache'];
+const GATE_FLAGS = ['--base', '--head', '--repeat', '--working', '--no-record', '--no-auto', '--allow', '--detect-gaming', '--no-detect-gaming', '--json', '--markdown', '--label', '--base-cache', '--pull-request'];
 const COMMAND_FLAGS = {
   run: GATE_FLAGS, init: ['--preset', '--list', '--force', '--no-agent-block'], lock: [], calibrate: ['--runs', '--repeat', '--metric', '--json'],
   insights: ['--json'], playbook: ['--json'], suggest: ['--json'],
@@ -3047,9 +3190,9 @@ async function prAllow(argv = []) {
 
 // pr-comment: what the Action does with the comment, decided here so the Action's shell stays thin (commentPlan).
 // Prints one word: `none`, `create`, or `update:<comment id>`. Writes the comment to --body (empty for `none`) and
-// adds the whole report to --summary. A file that is missing or empty reads as nothing; a flag it does not know is a
+// adds the whole report to --summary, and writes to --log what the step that fails prints. A file that is missing or empty reads as nothing; a flag it does not know is a
 // usage error, so a typo in a workflow cannot switch comment-only off in silence.
-const PR_COMMENT_FLAGS = ['--report', '--exit', '--error', '--comments', '--key', '--note', '--comment', '--inconclusive', '--comment-only', '--body', '--summary'];
+const PR_COMMENT_FLAGS = ['--report', '--exit', '--error', '--comments', '--key', '--note', '--comment', '--inconclusive', '--comment-only', '--body', '--summary', '--log'];
 function prComment(argv = []) {
   const o = {};
   for (let i = 0; i < argv.length; i += 2) {
@@ -3063,6 +3206,7 @@ function prComment(argv = []) {
   const p = commentPlan({ report, exit: o.exit, error: read(o.error), comments: readComments(read(o.comments)), key: o.key, note: read(o.note), comment: o.comment, inconclusive: o.inconclusive, commentOnly: o['comment-only'] === 'true' });
   if (o.body) writeFileSync(o.body, p.body ? p.body + '\n' : '');
   if (o.summary) { try { appendFileSync(o.summary, p.summary + '\n'); } catch { /* the summary is a courtesy */ } }
+  if (o.log) writeFileSync(o.log, p.log ? p.log + '\n' : '');
   process.stdout.write(p.action === 'update' ? `update:${p.id}\n` : `${p.action}\n`);
 }
 
